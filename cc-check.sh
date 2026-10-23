@@ -1,0 +1,1467 @@
+#!/bin/bash
+# cc-check.sh
+# Claude / Claude Code 运行环境体检: 多信号加权打分 + 问题清单 + 修复建议 + 自动修复。
+#
+# 评分模型参考 https://github.com/yacuo/check-cc (MIT)，但那边是浏览器端检测(WebRTC /
+# Client Hints / Emoji 渲染 / 字体探测靠 JS 拿)，这里是 macOS 本地实现: 凡是 shell 能测的
+# 信号全部覆盖(出口/质量/画像/DNS/稳定)，浏览器独有的 WebRTC、时区语言、请求头和
+# 渲染信号由菜单栏 App 的浏览器桥接采集。评分仍是经过测试的 26 项/100 分；v4.6 起
+# 另采集 40+ 原始诊断维度用于完整报告，不把未经校准的新字段偷偷加入评分。
+#
+# 用法:
+#   ./cc-check.sh              # 体检并打印报告
+#   ./cc-check.sh --fix        # 体检 + 自动修安全且可恢复的项目，再重新打分
+#   ./cc-check.sh --fix-locale # --fix 的兼容别名
+#   ./cc-check.sh --quiet      # 只写状态文件，不打印
+
+set -uo pipefail
+
+DATA_DIR="${CC_DATA_DIR:-$HOME/Library/Application Support/cc}"
+mkdir -p "$DATA_DIR" 2>/dev/null || true
+STATUS="$DATA_DIR/status"                # cc-network.sh 写的三路出口快照
+CSTATUS="$DATA_DIR/claude_status"        # 本脚本写的体检快照(菜单栏 App 读)
+CCANDIDATE="$DATA_DIR/claude_status_candidate" # 单次异常候选，不覆盖上次有效评分
+CPROBE_STATE="$DATA_DIR/claude_probe_state"   # 总评分防抖状态
+SCORE_CONFIRM_REQUIRED=2
+LOG="$DATA_DIR/cc-network.log"
+NETWORK_HISTORY="$DATA_DIR/network_history"  # cc-network.sh 写入，字段 5 只标记已确认的 IP 变化
+SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
+TZ_SCRIPT="$SELF_DIR/cc-network.sh"
+TMP="${TMPDIR:-/tmp}/cc.$$"; mkdir -p "$TMP"
+trap 'rm -rf "$TMP"' EXIT
+
+source "$SELF_DIR/cc-consent.sh"
+MODE="report"; DO_FIX=0; FIX_LOCALE=0; REPAIR_CONFIRMED=0; FORCE_REFRESH=0
+for arg in "$@"; do
+  case "$arg" in
+    --fix|--fix-locale) DO_FIX=1; FIX_LOCALE=1 ;;
+    --quiet) MODE="quiet" ;;
+    --refresh-network) FORCE_REFRESH=1 ;;
+    --yes) REPAIR_CONFIRMED=1 ;;
+    *) echo "未知参数：$arg" >&2; exit 2 ;;
+  esac
+done
+
+CURL='curl -fsS --max-time 9 -A Mozilla/5.0'
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >>"$LOG" 2>/dev/null || true; }
+
+# Anthropic 明确不提供服务的地区
+UNSUPPORTED="CN HK MO RU IR KP CU SY BY VE"
+SUPPORTED="US CA GB IE DE FR NL SE NO DK FI IT ES PT PL CZ AT CH BE LU JP KR SG TW AU NZ IL AE MX BR IN PH TH MY ID VN ZA TR SA AR CL"
+# 常见国内公共 DNS，直接用它解析 = DNS 请求泄漏到国内
+CN_DNS="114.114.114.114 114.114.115.115 223.5.5.5 223.6.6.6 119.29.29.29 182.254.116.116 180.76.76.76 117.50.10.10 1.2.4.8 210.2.4.8"
+
+# 重点地区的具体情况，比笼统一句"不在服务范围"有用
+region_note() {
+  case "$1" in
+    CN)          echo "中国大陆：Anthropic 未在此开放服务，登录、订阅与 API 申请均会被拒" ;;
+    HK|MO)       echo "港澳：不在 Anthropic 支持地区列表内，与大陆同样不可用" ;;
+    RU|BY)       echo "俄罗斯/白俄罗斯：受制裁限制，服务与订阅不可用" ;;
+    IR|KP|CU|SY) echo "受美国制裁地区，Anthropic 服务完全不可用" ;;
+    VE)          echo "委内瑞拉：不在支持地区列表内" ;;
+    *)           echo "该地区不在 Anthropic 支持列表内" ;;
+  esac
+}
+
+in_list() { case " $2 " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
+
+normalize_lang_tag() {
+  local tag="${1%%,*}"
+  tag="${tag%%;*}"
+  tag=$(printf '%s' "$tag" | tr '_' '-' | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
+  printf '%s\n' "$tag"
+}
+
+lang_region() {
+  local tag part region=""
+  tag=$(normalize_lang_tag "$1")
+  IFS='-' read -ra parts <<<"$tag"
+  for part in "${parts[@]}"; do
+    [[ ${#part} -eq 2 && "$part" =~ ^[a-z][a-z]$ ]] && region=$(printf '%s' "$part" | tr '[:lower:]' '[:upper:]')
+  done
+  printf '%s\n' "$region"
+}
+
+language_variant() {
+  local tag
+  tag=$(normalize_lang_tag "$1")
+  case "$tag" in
+    zh-hant*|zh-tw*|zh-hk*|zh-mo*) echo traditional ;;
+    zh-hans*|zh-cn*|zh-sg*|zh-my*) echo simplified ;;
+    *) echo unknown ;;
+  esac
+}
+
+# IP 不能唯一决定语言。这里只把高置信冲突判成问题；英语、地区码匹配和
+# 无法可靠归类的语言都不扣“风险分”，避免把个人语言偏好当成风控事实。
+language_status() {
+  local tag country base region variant
+  tag=$(normalize_lang_tag "$1"); country=$(printf '%s' "$2" | tr '[:lower:]' '[:upper:]')
+  [[ -z "$tag" || -z "$country" ]] && { echo unknown; return; }
+  base="${tag%%-*}"; region=$(lang_region "$tag")
+  [[ -n "$region" && "$region" == "$country" ]] && { echo preferred; return; }
+  [[ "$base" == "en" ]] && { echo compatible; return; }
+  [[ "$base" != "zh" ]] && { echo unknown; return; }
+
+  variant=$(language_variant "$tag")
+  case "$country:$variant" in
+    TW:traditional|HK:traditional|MO:traditional|CN:simplified|SG:simplified|MY:simplified)
+      echo compatible ;;
+    TW:simplified|HK:simplified|MO:simplified|CN:traditional|SG:traditional|MY:traditional)
+      echo conflict ;;
+    *:traditional|*:simplified)
+      echo conflict ;;
+    *)
+      echo unknown ;;
+  esac
+}
+
+recommended_locale() {
+  case "$(printf '%s' "$1" | tr '[:lower:]' '[:upper:]')" in
+    US) echo en-US ;; CA) echo en-CA ;; GB) echo en-GB ;; IE) echo en-IE ;;
+    DE) echo de-DE ;; FR) echo fr-FR ;; NL) echo nl-NL ;; SE) echo sv-SE ;;
+    NO) echo nb-NO ;; DK) echo da-DK ;; FI) echo fi-FI ;; IT) echo it-IT ;;
+    ES) echo es-ES ;; PT) echo pt-PT ;; PL) echo pl-PL ;; CZ) echo cs-CZ ;;
+    AT) echo de-AT ;; CH) echo de-CH ;; BE) echo nl-BE ;; LU) echo fr-LU ;;
+    JP) echo ja-JP ;; KR) echo ko-KR ;; SG) echo en-SG ;; TW) echo zh-TW ;;
+    AU) echo en-AU ;; NZ) echo en-NZ ;; IL) echo he-IL ;; AE) echo ar-AE ;;
+    MX) echo es-MX ;; BR) echo pt-BR ;; IN) echo en-IN ;; PH) echo en-PH ;;
+    TH) echo th-TH ;; MY) echo ms-MY ;; ID) echo id-ID ;; VN) echo vi-VN ;;
+    ZA) echo en-ZA ;; TR) echo tr-TR ;; SA) echo ar-SA ;; AR) echo es-AR ;;
+    CL) echo es-CL ;; CN) echo zh-CN ;; HK) echo zh-HK ;; MO) echo zh-Hant-MO ;;
+    *) echo en-US ;;
+  esac
+}
+
+recommended_language() {
+  case "$(printf '%s' "$1" | tr '[:lower:]' '[:upper:]')" in
+    TW) echo zh-TW ;; HK) echo zh-HK ;; MO) echo zh-Hant-MO ;;
+    CN) echo zh-CN ;; SG) echo zh-SG ;; MY) echo zh-MY ;;
+    *) recommended_locale "$1" ;;
+  esac
+}
+
+language_conflict_text() {
+  case "$(language_variant "$1")" in
+    traditional) echo 繁体中文 ;;
+    simplified) echo 简体中文 ;;
+    *) echo "语言 $(normalize_lang_tag "$1")" ;;
+  esac
+}
+
+browser_language_hint() {
+  local target browser
+  target=$(recommended_language "${COUNTRY:-}")
+  browser="${BR_BROWSER:-浏览器}"
+  case "$browser" in
+    *Chrome*) echo "打开 Chrome 设置 → 语言；添加 ${target} 并移到首位；完全退出后重开 Chrome，再点「重新体检」" ;;
+    *Edge*) echo "打开 Edge 设置 → 语言；添加 ${target} 并移到首位；完全退出后重开 Edge，再点「重新体检」" ;;
+    *Firefox*) echo "打开 Firefox 设置 → 常规 → 语言；把 ${target} 调到首位；重启 Firefox，再点「重新体检」" ;;
+    *Safari*) echo "系统设置 → 通用 → 语言与地区 → 应用程序 → Safari；选择 ${target}；重开 Safari，再点「重新体检」" ;;
+    *) echo "浏览器设置 → 语言；把 ${target} 调到首位；重启浏览器后点「重新体检」" ;;
+  esac
+}
+
+# ── 信号表 ──────────────────────────────────────────────────────
+# 加一项检测 = 调一次 sig。字段用 ~ 分隔(| 留给 issues/fixes 的多条分隔)
+# sig <分组> <标签> <权重> <达成率0-100> <展示值> [问题] [建议]
+SIGNALS=(); SCORE=0; ISSUES=""; FIXES=""
+add_issue() { ISSUES+="${ISSUES:+|}$1"; }
+add_fix()   { FIXES+="${FIXES:+|}$1"; }
+sig() {
+  local pts=$(( $3 * $4 / 100 ))
+  SCORE=$((SCORE + pts))
+  SIGNALS+=("$1~$2~$3~$pts~$5")
+  [[ -n "${6:-}" ]] && add_issue "$6"
+  [[ -n "${7:-}" ]] && add_fix "$7"
+  return 0
+}
+
+status_value() {
+  local file="$1" key="$2"
+  [[ -f "$file" ]] || return 1
+  sed -n "s/^${key}=//p" "$file" | head -1
+}
+
+write_score_probe_state() {
+  local state="$1" failures="$2" candidate="$3" detail="$4"
+  local tmp="${CPROBE_STATE}.tmp.$$"
+  {
+    echo "time=$(date '+%Y-%m-%d %H:%M:%S')"
+    echo "state=$state"
+    echo "failure_count=$failures"
+    echo "confirm_required=$SCORE_CONFIRM_REQUIRED"
+    echo "candidate_score=$candidate"
+    echo "detail=$detail"
+  } >"$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
+  mv -f "$tmp" "$CPROBE_STATE" 2>/dev/null || { rm -f "$tmp"; return 1; }
+}
+
+# 只把“探测没拿到数据”当作可防抖故障。HTTP 403、地区/时区冲突等有明确
+# 返回值的真实风险仍立即发布，不能被旧高分掩盖。
+transient_check_reasons() {
+  local reasons=""
+  [[ "${API_CODE:-000}" == "000" ]] && reasons+="${reasons:+、}Anthropic API 超时"
+  [[ "${WEB_CODE:-000}" == "000" ]] && reasons+="${reasons:+、}claude.ai 超时"
+  [[ "${SITE_CODE:-000}" == "000" ]] && reasons+="${reasons:+、}anthropic.com 超时"
+  [[ "${INTEL_COUNT:-0}" -lt 2 ]] && reasons+="${reasons:+、}IP 情报不足"
+  [[ -z "${CF_IP:-}" || -z "${CF_LOC:-}" ]] && reasons+="${reasons:+、}Cloudflare 探测失败"
+  [[ "${DNS_VERDICT:-}" == "解析失败" ]] && reasons+="${reasons:+、}DNS 解析失败"
+  printf '%s\n' "$reasons"
+}
+
+confirmed_risk_present() {
+  [[ -n "${COUNTRY:-}" ]] && in_list "$COUNTRY" "$UNSUPPORTED" && return 0
+  [[ "${API_CODE:-}" == "403" || "${API_REGION_BLOCK:-0}" == "1" ]] && return 0
+  [[ "${CONSISTENT:-1}" != "1" ]] && return 0
+  [[ "${GFW_TZ:-}" == */* && "${SYS_TZ:-}" != "${GFW_TZ:-}" ]] && return 0
+  [[ -n "${IPV6:-}" && -n "${IPV6_CC:-}" && "${IPV6_CC}" != "${COUNTRY:-}" ]] && return 0
+  if [[ "${BR_RTC_STATUS:-}" == "ok" && -n "${BR_RTC:-}" && "${BR_RTC}" != *"${PROBE_IP:-?}"* ]]; then
+    return 0
+  fi
+  [[ "${DNS_VERDICT:-}" == 被污染* ]] && return 0
+  return 1
+}
+
+# ── 采集: 三路出口快照(复用 cc-network.sh 的结果) ─────────────
+read_status() {
+  REGION_STATE=unknown
+  NETWORK_STATE="unknown"; NETWORK_COMPLETE=0; NETWORK_LAST_SUCCESS=""
+  CONSISTENT="unknown"; GFW_IP=""; INTL_IP=""; CN_IP=""; SYS_TZ=""; GFW_TZ=""; GOOGLE=""
+  [[ -f "$STATUS" ]] || return 1
+  while IFS='=' read -r k v; do
+    case "$k" in
+      region_state) REGION_STATE="$v" ;;
+      network) NETWORK_STATE="$v" ;; probe_complete) NETWORK_COMPLETE="$v" ;; last_success) NETWORK_LAST_SUCCESS="$v" ;;
+      consistent) CONSISTENT="$v" ;; gfw) GFW_IP="$v" ;; intl) INTL_IP="$v" ;;
+      cn) CN_IP="$v" ;; tz) SYS_TZ="$v" ;; gfwtz) GFW_TZ="$v" ;; google) GOOGLE="$v" ;;
+    esac
+  done <"$STATUS"
+  # 旧快照的成功标记不能在失败/复核期间复用；超过五分钟视为过期。
+  if [[ "$CONSISTENT" == "1" && "$NETWORK_STATE" != "ok" && "$NETWORK_COMPLETE" != "1" ]]; then CONSISTENT=unknown; fi
+  local age=$(( $(date +%s) - $(stat -f %m "$STATUS" 2>/dev/null || echo 0) ))
+  if [[ $age -gt 300 ]]; then CONSISTENT=unknown; NETWORK_STATE=stale; fi
+  [[ "$REGION_STATE" == "ok" && "$NETWORK_STATE" != "stale" ]] || GFW_TZ=""
+  [[ -n "$CONSISTENT" ]]
+}
+refresh_base() {
+  local age=999999
+  [[ -f "$STATUS" ]] && age=$(( $(date +%s) - $(stat -f %m "$STATUS" 2>/dev/null || echo 0) ))
+  local refresh_rc=0
+  if [[ -f "$TZ_SCRIPT" ]]; then
+    if [[ "$FORCE_REFRESH" == "1" ]]; then
+      CC_DATA_DIR="$DATA_DIR" bash "$TZ_SCRIPT" --check --wait-lock >/dev/null 2>&1 || refresh_rc=$?
+    elif [[ $age -gt 300 ]]; then
+      CC_DATA_DIR="$DATA_DIR" bash "$TZ_SCRIPT" --check >/dev/null 2>&1 || true
+    fi
+  fi
+  read_status || true
+  if [[ $refresh_rc -eq 75 ]]; then
+    CONSISTENT=unknown; GFW_IP="?"; INTL_IP="?"; CN_IP="?"; GFW_TZ=""; NETWORK_STATE=stale
+  fi
+  : "${INTL_IP:=?}" "${GFW_IP:=?}" "${CN_IP:=?}" "${SYS_TZ:=?}" "${GFW_TZ:=}" "${CONSISTENT:=unknown}"
+  PROBE_IP="$GFW_IP"; [[ "$PROBE_IP" == "?" ]] && PROBE_IP="$INTL_IP"
+}
+
+# ── 采集: 并行发网络请求(串行会拖到 60 秒以上) ──────────────────
+fetch_all() {
+  local ip="$PROBE_IP"
+  ( [[ "$ip" != "?" ]] && $CURL "http://ip-api.com/json/${ip}?fields=status,country,countryCode,region,city,isp,org,as,asname,proxy,hosting" >"$TMP/ipapi" 2>/dev/null ) &
+  ( [[ "$ip" != "?" ]] && $CURL "https://ipinfo.io/${ip}/json" >"$TMP/ipinfo" 2>/dev/null ) &
+  ( [[ "$ip" != "?" ]] && $CURL "https://ipwho.is/${ip}" >"$TMP/ipwho" 2>/dev/null ) &
+  ( [[ "$ip" != "?" ]] && $CURL "https://api.ip.sb/geoip/${ip}" >"$TMP/ipsb" 2>/dev/null ) &
+  ( $CURL "https://www.cloudflare.com/cdn-cgi/trace" >"$TMP/cftrace" 2>/dev/null ) &
+  ( curl -s -m 10 -o "$TMP/apibody" -w '%{http_code}' -H 'content-type: application/json' \
+      https://api.anthropic.com/v1/messages -d '{}' >"$TMP/apicode" 2>/dev/null ) &
+  # 测 robots.txt 而不是主页: 主页对裸 curl 一律返 403(Cloudflare bot 挑战)，带浏览器 UA 也一样，
+  # 那是反爬不是地区拦截，拿它判可达性会稳定误报。静态资源不触发挑战，能真实反映地区可达。
+  ( curl -s -m 10 -o /dev/null -w '%{http_code}' https://claude.ai/robots.txt >"$TMP/webcode" 2>/dev/null ) &
+  ( curl -s -m 10 -o /dev/null -w '%{http_code}' https://www.anthropic.com/robots.txt >"$TMP/sitecode" 2>/dev/null ) &
+  ( ip_v6 >"$TMP/ipv6" 2>/dev/null ) &
+  wait
+}
+
+jget() { grep -Eo "\"$2\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" "$1" 2>/dev/null | head -1 | cut -d'"' -f4; }
+jnum() { grep -Eo "\"$2\"[[:space:]]*:[[:space:]]*-?[0-9]+([.][0-9]+)?" "$1" 2>/dev/null | head -1 | sed 's/.*:[[:space:]]*//'; }
+ip_country_code() {
+  local ip="$1"
+  jget <($CURL "http://ip-api.com/json/${ip}?fields=countryCode") countryCode 2>/dev/null
+}
+
+is_ipv6() { [[ "$1" == *:*:* && ${#1} -le 39 && "$1" =~ ^[0-9a-f:]+$ ]]; }
+
+# 本机接口上的全局 IPv6（排除链路本地、回环和 ULA），用来区分“本机直连”与“代理/上游出口”。
+local_ipv6_addrs() {
+  ifconfig 2>/dev/null | awk '$1 == "inet6" { sub(/%.*/, "", $2); print tolower($2) }' \
+    | grep -Ev '^(fe80:|::1$|f[cd])' || true
+}
+
+# IPv6 出口探测，输出“状态|地址|来源”：
+#   ok|地址|local     回显地址就是本机接口地址，IPv6 绕过了代理直连
+#   ok|地址|upstream  回显地址不在本机，来自代理节点或上游（如 fake-ip 下由代理经 IPv6 访问）
+#   none||            探测不到 IPv6 出口，且本机没有全局 IPv6，不存在 IPv6 泄漏面
+#   failed||          本机有全局 IPv6 但探测未完成，结果未知
+# 只用两个纯 IPv6 回显站点，避免回退到其他域名后走不同分流规则。
+ip_v6() {
+  local url ip local_addrs
+  local_addrs=$(local_ipv6_addrs)
+  for url in "https://api6.ipify.org" "https://ipv6.icanhazip.com"; do
+    ip=$($CURL -6 --connect-timeout 4 --max-time 6 "$url" 2>/dev/null | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
+    if is_ipv6 "$ip"; then
+      if grep -qxF "$ip" <<<"$local_addrs"; then echo "ok|$ip|local"; else echo "ok|$ip|upstream"; fi
+      return 0
+    fi
+  done
+  if [[ -n "$local_addrs" ]]; then echo "failed||"; else echo "none||"; fi
+}
+
+# IPv6 归属走 HTTPS，可能是本机真实地址，不用明文接口查询。
+ipv6_country_code() {
+  local ip="$1" cc
+  cc=$($CURL "https://ipinfo.io/${ip}/country" 2>/dev/null | tr -d '[:space:]' | tr '[:lower:]' '[:upper:]')
+  [[ "$cc" =~ ^[A-Z]{2}$ ]] && { echo "$cc"; return 0; }
+  cc=$(jget <($CURL "https://ipwho.is/${ip}?fields=country_code" 2>/dev/null) country_code | tr '[:lower:]' '[:upper:]')
+  [[ "$cc" =~ ^[A-Z]{2}$ ]] && { echo "$cc"; return 0; }
+  return 1
+}
+
+parse_net() {
+  COUNTRY=""; COUNTRY_NAME=""; CITY=""; ISP=""; ASN=""; HOSTING=-1; PROXY=0
+  ASN_NUM=""; ASN_NUM2=""; ASN_MATCH=-1
+  if [[ -s "$TMP/ipapi" ]] && grep -q '"status":"success"' "$TMP/ipapi"; then
+    COUNTRY=$(jget "$TMP/ipapi" countryCode); COUNTRY_NAME=$(jget "$TMP/ipapi" country)
+    CITY=$(jget "$TMP/ipapi" city); ISP=$(jget "$TMP/ipapi" isp); ASN=$(jget "$TMP/ipapi" as)
+    HOSTING=0; grep -q '"hosting":true' "$TMP/ipapi" && HOSTING=1
+    grep -q '"proxy":true' "$TMP/ipapi" && PROXY=1
+  fi
+  # 四家情报源全部查询同一个 PROBE_IP；只比较 ISO 两位国家码，避免把
+  # "US"、"United States"、IPv6 或 CDN 中间节点混成冲突。
+  COUNTRY2=$(jget "$TMP/ipinfo" country); ISP2=$(jget "$TMP/ipinfo" org)
+  COUNTRY3=$(jget "$TMP/ipwho" country_code); ISP3=$(jget "$TMP/ipwho" org)
+  LATITUDE=$(jnum "$TMP/ipwho" latitude); LONGITUDE=$(jnum "$TMP/ipwho" longitude)
+  COUNTRY4=$(jget "$TMP/ipsb" country_code); ISP4=$(jget "$TMP/ipsb" organization)
+  COUNTRY=$(printf '%s' "$COUNTRY" | tr '[:lower:]' '[:upper:]')
+  COUNTRY2=$(printf '%s' "$COUNTRY2" | tr '[:lower:]' '[:upper:]')
+  COUNTRY3=$(printf '%s' "$COUNTRY3" | tr '[:lower:]' '[:upper:]')
+  COUNTRY4=$(printf '%s' "$COUNTRY4" | tr '[:lower:]' '[:upper:]')
+  INTEL_SOURCES=""; INTEL_COUNTRIES=""; INTEL_COUNT=0
+  local name cc
+  for name in ip-api ipinfo ipwho ip.sb; do
+    case "$name" in
+      ip-api) cc="$COUNTRY" ;; ipinfo) cc="$COUNTRY2" ;; ipwho) cc="$COUNTRY3" ;; ip.sb) cc="$COUNTRY4" ;;
+    esac
+    [[ "$cc" =~ ^[A-Z]{2}$ ]] || continue
+    INTEL_COUNT=$((INTEL_COUNT + 1))
+    INTEL_SOURCES+="${INTEL_SOURCES:+,}${name}:${cc}"
+    INTEL_COUNTRIES+="${INTEL_COUNTRIES:+ }${cc}"
+  done
+  # ASN 交叉比对: 国家码一致不等于归属一致。同一个 IP 在 ip-api 报 AS5065 住宅 ISP、
+  # 在 ipinfo 报 AS3257 GTT(骨干/IDC)，说明这段 IP 的归属登记本身有分歧 ——
+  # 风控侧按哪一家判都有可能，只比国家码会把这种 IP 当成干净住宅放过去。
+  ASN_NUM=$(printf '%s' "$ASN"  | grep -Eo '^AS[0-9]+' || true)
+  ASN_NUM2=$(printf '%s' "$ISP2" | grep -Eo '^AS[0-9]+' || true)
+  if [[ -n "$ASN_NUM" && -n "$ASN_NUM2" ]]; then
+    ASN_MATCH=$([[ "$ASN_NUM" == "$ASN_NUM2" ]] && echo 1 || echo 0)
+  else
+    ASN_MATCH=-1
+  fi
+  if [[ -z "$COUNTRY" ]]; then
+    if [[ -n "$COUNTRY2" ]]; then COUNTRY="$COUNTRY2"; COUNTRY_NAME="$COUNTRY2"; ISP="$ISP2"
+    elif [[ -n "$COUNTRY3" ]]; then COUNTRY="$COUNTRY3"; COUNTRY_NAME="$COUNTRY3"; ISP="$ISP3"
+    elif [[ -n "$COUNTRY4" ]]; then COUNTRY="$COUNTRY4"; COUNTRY_NAME="$COUNTRY4"; ISP="$ISP4"
+    fi
+  fi
+  # Cloudflare 边缘: 你实际落到哪个机房，反映真实网络位置(比 IP 库更难伪造)
+  CF_COLO=""; CF_LOC=""; CF_IP=""; CF_WARP=""
+  if [[ -s "$TMP/cftrace" ]]; then
+    CF_COLO=$(grep '^colo=' "$TMP/cftrace" | cut -d= -f2)
+    CF_LOC=$(grep '^loc='  "$TMP/cftrace" | cut -d= -f2)
+    CF_IP=$(grep '^ip='    "$TMP/cftrace" | cut -d= -f2)
+    CF_WARP=$(grep '^warp=' "$TMP/cftrace" | cut -d= -f2)
+  fi
+  API_CODE=$(cat "$TMP/apicode" 2>/dev/null); API_CODE="${API_CODE:-000}"
+  WEB_CODE=$(cat "$TMP/webcode" 2>/dev/null); WEB_CODE="${WEB_CODE:-000}"
+  SITE_CODE=$(cat "$TMP/sitecode" 2>/dev/null); SITE_CODE="${SITE_CODE:-000}"
+  IPV6_STATUS=""; IPV6=""; IPV6_ORIGIN=""; IPV6_CC=""
+  IFS='|' read -r IPV6_STATUS IPV6 IPV6_ORIGIN <<<"$(head -1 "$TMP/ipv6" 2>/dev/null | tr -d '[:space:]')"
+  case "$IPV6_STATUS" in
+    ok) is_ipv6 "$IPV6" || { IPV6_STATUS=failed; IPV6=""; IPV6_ORIGIN=""; } ;;
+    none) IPV6=""; IPV6_ORIGIN="" ;;
+    *) IPV6_STATUS=failed; IPV6=""; IPV6_ORIGIN="" ;;   # 空文件或异常输出：探测未完成，不能当作没有 IPv6
+  esac
+  [[ -n "$IPV6" ]] && IPV6_CC=$(ipv6_country_code "$IPV6" || true)
+  API_REGION_BLOCK=0
+  grep -qi 'unsupported_country\|not available in your' "$TMP/apibody" 2>/dev/null && API_REGION_BLOCK=1
+}
+
+# ── 采集: DNS ───────────────────────────────────────────────────
+parse_dns() {
+  DNS_SERVERS=$(scutil --dns 2>/dev/null | awk '/nameserver\[/{print $3}' | sort -u | head -3 | tr '\n' ' ')
+  DNS_SCOPE="未知"
+  local s first_public=""
+  for s in $DNS_SERVERS; do
+    case "$s" in
+      127.*|::1|10.*|192.168.*|172.1[6-9].*|172.2[0-9].*|172.3[01].*|198.18.*|100.64.*) : ;;
+      *) [[ -z "$first_public" ]] && first_public="$s" ;;
+    esac
+  done
+  if [[ -z "$first_public" ]]; then
+    DNS_SCOPE="本地/代理接管"
+  elif in_list "$first_public" "$CN_DNS"; then
+    DNS_SCOPE="国内公共DNS($first_public)"
+  else
+    DNS_SCOPE="境外/自定义($first_public)"
+  fi
+  # 解析 claude.ai，看是被代理接管(fake-ip)、正常拿到 Cloudflare IP，还是被污染
+  DNS_RESULT=$(dscacheutil -q host -a name claude.ai 2>/dev/null | awk '/^ip_address:/{print $2}' | head -1)
+  DNS_VERDICT="失败"
+  case "${DNS_RESULT:-}" in
+    "")                       DNS_VERDICT="解析失败" ;;
+    198.18.*|198.19.*|240.*)  DNS_VERDICT="代理接管(fake-ip)" ;;
+    0.0.0.0|127.*|10.*|192.168.*) DNS_VERDICT="被污染(指向私有地址)" ;;
+    # 160.79.104.0/23 是 Anthropic 自有段(AS399358)，claude.ai 已从纯 Cloudflare 迁过来
+    160.79.10[45].*)          DNS_VERDICT="正常(Anthropic)" ;;
+    104.*|172.6[4-9].*|172.7[0-1].*|162.15[89].*|188.114.*|141.101.*) DNS_VERDICT="正常(Cloudflare)" ;;
+    *)                        DNS_VERDICT="可疑(${DNS_RESULT})" ;;
+  esac
+}
+
+# ── 采集: 系统画像 ──────────────────────────────────────────────
+parse_system() {
+  OS_VER="macOS $(sw_vers -productVersion 2>/dev/null)"
+  SYS_LOCALE=$(defaults read -g AppleLocale 2>/dev/null || echo "")
+  SYS_LANGS=$(defaults read -g AppleLanguages 2>/dev/null | grep -Eo '"[a-zA-Z-]+"' | tr -d '"' | tr '\n' ',' | sed 's/,$//')
+  SYS_LANG="${SYS_LANGS%%,*}"
+  LOCALE_CC="${SYS_LOCALE##*_}"; [[ "$LOCALE_CC" == "$SYS_LOCALE" ]] && LOCALE_CC=""
+  TZ_OFFSET=$(date +%z)                       # 如 -0700
+  TZ_ABBR=$(date +%Z)                         # 如 PDT
+  # 时区偏移与时区名是否自洽(手动改过偏移 / TZ 环境变量覆盖会露馅)
+  local expect
+  expect=$(TZ="$SYS_TZ" date +%z 2>/dev/null)
+  TZ_SELF_CONSISTENT=$([[ "$expect" == "$TZ_OFFSET" ]] && echo 1 || echo 0)
+  # 代理形态: TUN 接管(默认路由走 utun) / 系统 HTTP 代理 / PAC 自动配置
+  PROXY_MODE="直连"
+  local dev pac http_p
+  # TUN 类代理(FlClash/Clash/Surge)靠 0.0.0.0/1 + 128.0.0.0/1 抢公网流量，**不动 default 路由**，
+  # 所以查 default 只会看到物理网卡，误判成"直连"。要看去公网的地址实际走哪个接口。
+  dev=$(route -n get 93.184.216.34 2>/dev/null | awk '/interface:/{print $2}')
+  [[ -z "$dev" ]] && dev=$(route -n get default 2>/dev/null | awk '/interface:/{print $2}')
+  [[ "$dev" == utun* ]] && PROXY_MODE="TUN 全局"
+  http_p=$(scutil --proxy 2>/dev/null | awk '/HTTPEnable/{print $3}')
+  pac=$(scutil --proxy 2>/dev/null | awk '/ProxyAutoConfigEnable/{print $3}')
+  [[ "$PROXY_MODE" == "直连" && "$http_p" == "1" ]] && PROXY_MODE="系统 HTTP 代理"
+  [[ "$pac" == "1" ]] && PROXY_MODE="$PROXY_MODE + PAC 分流"
+  PAC_ON=$([[ "$pac" == "1" ]] && echo 1 || echo 0)
+}
+
+# ── 采集: 环境稳定性 / 运行容器 ─────────────────────────────────
+# 账号画像里"设备连续性"这一项，网页端做不了(没有历史)，但我们有本地日志。
+parse_stability() {
+  IP_CHANGES=0
+  if [[ -f "$NETWORK_HISTORY" ]]; then
+    # 新历史的第 5 字段只在连续确认后的真实 IP 变化时为 1；接口失败和恢复复核均为 0。
+    local since_epoch
+    since_epoch=$(( $(date +%s) - 86400 ))
+    IP_CHANGES=$(awk -F'|' -v since="$since_epoch" '$1 >= since && $5 == 1 {n++} END {print n+0}'       "$NETWORK_HISTORY" 2>/dev/null)
+  elif [[ -f "$LOG" ]]; then
+    # 仅给尚未生成 network_history 的老安装保留兼容回退。
+    local since
+    since=$(date -v-24H '+%Y-%m-%d %H:%M:%S' 2>/dev/null)
+    IP_CHANGES=$(awk -v s="[$since]" '$0 >= s && /出口 IP 变化/' "$LOG" 2>/dev/null | wc -l | tr -d ' ')
+  fi
+  # 虚拟机里跑 = 设备指纹异常，是风控关注的信号
+  VM_HOST="物理机"
+  local hv model
+  hv=$(sysctl -n kern.hv_vmm_present 2>/dev/null)
+  model=$(sysctl -n hw.model 2>/dev/null)
+  [[ "$hv" == "1" ]] && VM_HOST="虚拟机"
+  case "$model" in VMware*|Parallels*|VirtualBox*|Virtual*) VM_HOST="虚拟机($model)" ;; esac
+}
+
+# ── 采集: 浏览器信号(菜单栏 App 的隐藏 WKWebView 写的) ──────────
+parse_browser() {
+  BR_OK=0; BR_TZ=""; BR_LANGS=""; BR_LOCALE=""; BR_RTC=""; BR_RTC_HOST=""
+  BR_RTC_STATUS=""; BR_RTC_SUPPORTED=""; BR_RTC_CANDIDATES=""; BR_RTC_PUBLIC_COUNT=""
+  BR_RTC_MS=""; BR_RTC_ERROR=""
+  BR_SOURCE=""; BR_BROWSER=""; BR_UA=""; BR_UA_JS=""; BR_CH_UA=""; BR_CH_PLAT=""; BR_ACCEPT=""
+  BR_UAD_PLAT=""; BR_UAD_BRANDS=""; BR_SF_SITE=""; BR_SF_MODE=""; BR_SF_DEST=""
+  BR_REACH_ANTHROPIC=""; BR_REACH_ANTHROPIC_MS=""
+  BR_REACH_API=""; BR_REACH_API_MS=""
+  BR_FONTS=""; BR_WEBGL=""; BR_CANVAS=""; BR_AGE=999999
+  local f="$DATA_DIR/browser_signals"
+  [[ -f "$f" ]] || return 1
+  BR_AGE=$(( $(date +%s) - $(stat -f %m "$f" 2>/dev/null || echo 0) ))
+  while IFS='=' read -r k v; do
+    case "$k" in
+      tz) BR_TZ="$v" ;; languages) BR_LANGS="$v" ;; locale) BR_LOCALE="$v" ;;
+      source) BR_SOURCE="$v" ;; browser_name) BR_BROWSER="$v" ;; ua) BR_UA="$v" ;; ua_js) BR_UA_JS="$v" ;;
+      ch_ua) BR_CH_UA="$v" ;; ch_platform) BR_CH_PLAT="$v" ;; accept_lang) BR_ACCEPT="$v" ;;
+      uad_platform) BR_UAD_PLAT="$v" ;; uad_brands) BR_UAD_BRANDS="$v" ;;
+      sf_site) BR_SF_SITE="$v" ;; sf_mode) BR_SF_MODE="$v" ;; sf_dest) BR_SF_DEST="$v" ;;
+      reach_anthropic) BR_REACH_ANTHROPIC="$v" ;; reach_anthropic_ms) BR_REACH_ANTHROPIC_MS="$v" ;;
+      reach_api) BR_REACH_API="$v" ;; reach_api_ms) BR_REACH_API_MS="$v" ;;
+      rtc_srflx) BR_RTC="$v" ;; rtc_host) BR_RTC_HOST="$v" ;; rtc_status) BR_RTC_STATUS="$v" ;;
+      rtc_supported) BR_RTC_SUPPORTED="$v" ;; rtc_candidate_count) BR_RTC_CANDIDATES="$v" ;;
+      rtc_public_count) BR_RTC_PUBLIC_COUNT="$v" ;; rtc_elapsed_ms) BR_RTC_MS="$v" ;;
+      rtc_err) BR_RTC_ERROR="$v" ;; fonts) BR_FONTS="$v" ;;
+      webgl) BR_WEBGL="$v" ;; canvas) BR_CANVAS="$v" ;;
+    esac
+  done <"$f"
+  # 1 小时内、且拿到了时区，才认为这次采集有效
+  [[ $BR_AGE -lt 3600 && -n "$BR_TZ" ]] && BR_OK=1
+  return 0
+}
+
+# ── 采集: Claude Code 本地环境(信息项) ──────────────────────────
+parse_claude() {
+  CLAUDE_VER=""; CLAUDE_BASE=""
+  local bin
+  # App 启动的进程 PATH 很干净，命中不了 shell 里的安装位置，显式扫常见路径
+  bin=$(command -v claude 2>/dev/null) \
+    || bin=$(ls "$HOME/.local/bin/claude" "$HOME/.claude/local/claude" "$HOME/.bun/bin/claude" \
+               /usr/local/bin/claude /opt/homebrew/bin/claude 2>/dev/null | head -1)
+  [[ -n "$bin" ]] && CLAUDE_VER=$("$bin" --version 2>/dev/null | head -1)
+  CLAUDE_BASE="${ANTHROPIC_BASE_URL:-}"
+  [[ -z "$CLAUDE_BASE" && -f "$HOME/.claude/settings.json" ]] && \
+    CLAUDE_BASE=$(jget "$HOME/.claude/settings.json" ANTHROPIC_BASE_URL)
+  [[ -z "$CLAUDE_BASE" && -f "$HOME/.zshrc" ]] && \
+    CLAUDE_BASE=$(grep -E '^[[:space:]]*export[[:space:]]+ANTHROPIC_BASE_URL' "$HOME/.zshrc" | tail -1 | cut -d= -f2- | tr -d '"'"'"' ')
+}
+
+# 把分数、关键项和地区硬限制合并成用户能直接理解的风险档位。
+classify_risk() {
+  local critical="${1:-}"
+  SAFE_USE=0
+  if [[ "$GRADE" == "待确认" ]]; then
+    RISK_LEVEL="待确认"
+  elif [[ "$GRADE" == "优秀" ]]; then
+    RISK_LEVEL="安全"; SAFE_USE=1
+  elif [[ "$GRADE" == "风险" || "$GRADE" == "高风险" || -n "$critical" ]] \
+       || { [[ -n "$COUNTRY" ]] && in_list "$COUNTRY" "$UNSUPPORTED"; }; then
+    [[ $SCORE -lt 50 || "$GRADE" == "危险" ]] && RISK_LEVEL="极高风险" || RISK_LEVEL="高风险"
+  elif [[ $SCORE -ge 85 ]]; then
+    RISK_LEVEL="低风险"
+  elif [[ $SCORE -ge 70 ]]; then
+    RISK_LEVEL="中风险"
+  elif [[ $SCORE -ge 50 ]]; then
+    RISK_LEVEL="高风险"
+  else
+    RISK_LEVEL="极高风险"
+  fi
+}
+
+# ── 打分: 26 项加权信号，合计 100 ───────────────────────────────
+compute_score() {
+  SIGNALS=(); SCORE=0; ISSUES=""; FIXES=""; FIXABLE_TZ=""; FIXABLE_LOCALE=""; FIXABLE_LOCALE_TARGET=""
+  COUNTRY_CONFIRMED=0
+  BR_HEADER_INTEGRITY="unknown"
+  local relay=0
+  [[ -n "$CLAUDE_BASE" && "$CLAUDE_BASE" != *"api.anthropic.com"* ]] && relay=1
+
+  # ── A. 出口地区与服务可用 (35) ──
+  if [[ -z "$COUNTRY" ]]; then
+    sig 出口 "出口国家" 14 50 "未知" "出口 IP 归属地未知(IP 情报接口不可达)" "检查网络后重新体检"
+  elif in_list "$COUNTRY" "$UNSUPPORTED"; then
+    sig 出口 "出口国家" 14 0 "$COUNTRY 不支持" \
+      "出口国家 ${COUNTRY} 不在 Anthropic 服务范围，登录/订阅/API 均有封号风险" \
+      "切到美国/日本/新加坡等支持地区节点，并长期固定，不要频繁换国家"
+  elif in_list "$COUNTRY" "$SUPPORTED"; then
+    sig 出口 "出口国家" 14 100 "$COUNTRY ${CITY:-}"
+  else
+    sig 出口 "出口国家" 14 66 "$COUNTRY 支持未知" "出口国家 ${COUNTRY} 支持情况未知" "建议改用 US/JP/SG 等已知支持地区节点"
+  fi
+
+  if [[ "$API_CODE" == "401" || "$API_CODE" == "400" ]]; then
+    sig 出口 "Anthropic API 可达" 10 100 "HTTP $API_CODE"
+  elif [[ "$API_CODE" == "403" || "$API_REGION_BLOCK" == "1" ]]; then
+    sig 出口 "Anthropic API 可达" 10 0 "HTTP 403 地区拦截" \
+      "api.anthropic.com 返回 403，当前出口被地区拦截" "更换支持地区节点；确认代理为全局而非 PAC 分流"
+  elif [[ "$API_CODE" == "000" && $relay -eq 1 ]]; then
+    sig 出口 "Anthropic API 可达" 10 50 "直连不通(已配中转)" \
+      "api.anthropic.com 直连不通，但你已配置中转 ${CLAUDE_BASE}" "只用中转可忽略；需直连官方则开全局代理"
+  elif [[ "$API_CODE" == "000" ]]; then
+    sig 出口 "Anthropic API 可达" 10 0 "连不上" \
+      "api.anthropic.com 连不上(超时/DNS 污染)" "开启全局代理；检查 DNS 是否被污染"
+  else
+    sig 出口 "Anthropic API 可达" 10 50 "HTTP $API_CODE" "api.anthropic.com 返回异常状态 ${API_CODE}" "稍后重试；持续异常则换节点"
+  fi
+
+  case "$WEB_CODE" in
+    200|301|302|307) sig 出口 "claude.ai 可达" 2 100 "HTTP $WEB_CODE" ;;
+    403)             sig 出口 "claude.ai 可达" 2 20 "HTTP 403 被拦" \
+                       "claude.ai 返回 403(Cloudflare 地区拦截或风控挑战)" "换支持地区的干净节点，网页端登录前先确认能打开" ;;
+    000)             sig 出口 "claude.ai 可达" 2 0 "连不上" "claude.ai 连不上" "开启全局代理" ;;
+    *)               sig 出口 "claude.ai 可达" 2 60 "HTTP $WEB_CODE" ;;
+  esac
+
+  # anthropic.com 与 claude.ai 走的是不同的前端，分开测才能区分"整体被拦"和"单点异常"
+  case "$SITE_CODE" in
+    200|301|302|307) sig 出口 "anthropic.com 可达" 2 100 "HTTP $SITE_CODE" ;;
+    403)             sig 出口 "anthropic.com 可达" 2 20 "HTTP 403 被拦" \
+                       "anthropic.com 返回 403，官网侧也被拦" "换支持地区的干净节点" ;;
+    000)             sig 出口 "anthropic.com 可达" 2 0 "连不上" "anthropic.com 连不上" "开启全局代理" ;;
+    *)               sig 出口 "anthropic.com 可达" 2 60 "HTTP $SITE_CODE" ;;
+  esac
+
+  # 多源情报一致性：只比较针对同一个 PROBE_IP 返回的 ISO 国家码。
+  local intel_codes="" intel_count=0 intel_unique=0 raw_cc norm_cc intel_display=""
+  for raw_cc in "${COUNTRY:-}" "${COUNTRY2:-}" "${COUNTRY3:-}" "${COUNTRY4:-}"; do
+    norm_cc=$(printf '%s' "$raw_cc" | tr '[:lower:]' '[:upper:]')
+    [[ "$norm_cc" =~ ^[A-Z]{2}$ ]] || continue
+    intel_codes+="${intel_codes:+$'\n'}${norm_cc}"
+    intel_display+="${intel_display:+ / }${norm_cc}"
+    intel_count=$((intel_count + 1))
+  done
+  [[ -n "$intel_codes" ]] && intel_unique=$(printf '%s\n' "$intel_codes" | sort -u | grep -c . | tr -d ' ')
+  if [[ $intel_count -ge 2 && $intel_unique -eq 1 ]]; then
+    [[ -n "$COUNTRY" ]] && COUNTRY_CONFIRMED=1
+    if [[ "${ASN_MATCH:--1}" == "0" ]]; then
+      # 国家码一致但 ASN 归属分歧，风控按不同库判会得到不同结论，不能算"完全一致"
+      sig 出口 "多源情报一致" 3 50 "${intel_count}/4 · ${intel_display%% / *} · ASN 分歧" \
+        "同一出口 ${PROBE_IP} 的 ASN 归属不一致(ip-api: ${ASN_NUM} ${ISP} / ipinfo: ${ISP2})，这段 IP 的登记信息本身有争议" \
+        "换一个 ASN 归属明确、各情报库口径一致的节点"
+    else
+      sig 出口 "多源情报一致" 3 100 "${intel_count}/4 · ${intel_display%% / *}"
+    fi
+  elif [[ $intel_count -ge 2 ]]; then
+    sig 出口 "多源情报一致" 3 0 "${intel_count}/4 · ${intel_display}"       "多家 IP 情报库对同一出口 ${PROBE_IP} 的国家码判定不一致(${intel_display})" "换一个情报干净、归属明确的节点"
+  elif [[ $intel_count -eq 1 ]]; then
+    sig 出口 "多源情报一致" 3 50 "仅 1/4 来源可用 · ${intel_display}"
+  else
+    sig 出口 "多源情报一致" 3 50 "0/4 · 数据不足"
+  fi
+
+  # IPv6 出口: 没有最省心，有就必须和 IPv4 出口同地区，否则等于开了个后门。
+  # 探测未完成或归属查不到属于未知，只给部分分，不算关键项失败。
+  local v6_status="${IPV6_STATUS:-}"
+  if [[ -n "$IPV6" ]]; then v6_status=ok
+  elif [[ "$v6_status" != "failed" ]]; then v6_status=none
+  fi
+  if [[ "$v6_status" == "none" ]]; then
+    sig 出口 "IPv6 出口" 3 100 "无 IPv6 出口(无泄漏面)"
+  elif [[ "$v6_status" == "failed" ]]; then
+    sig 出口 "IPv6 出口" 3 70 "探测未完成" "本机有 IPv6 地址，但 IPv6 出口探测未完成，暂时无法确认是否泄漏" "稍后重新体检"
+  elif [[ -z "$IPV6_CC" || -z "$COUNTRY" ]]; then
+    sig 出口 "IPv6 出口" 3 60 "${IPV6:0:20}… 归属未知" "IPv6 出口存在但查不到归属"
+  elif [[ "$IPV6_CC" == "$COUNTRY" ]]; then
+    sig 出口 "IPv6 出口" 3 100 "$IPV6_CC 与 IPv4 一致"
+  elif [[ "${IPV6_ORIGIN:-}" == "local" ]]; then
+    sig 出口 "IPv6 出口" 3 0 "$IPV6_CC ≠ $COUNTRY(本机直连)" \
+      "IPv6 出口 ${IPV6} 是本机地址，归属 ${IPV6_CC}，与 IPv4 出口 ${COUNTRY} 不一致 —— 代理没接管 IPv6，真实地区被暴露" \
+      "在代理里开启 IPv6 接管，或在系统网络设置里关掉 IPv6"
+  else
+    sig 出口 "IPv6 出口" 3 0 "$IPV6_CC ≠ $COUNTRY" \
+      "IPv6 出口在 ${IPV6_CC}，与 IPv4 出口 ${COUNTRY} 不一致；该地址不在本机，来自代理节点或上游，网站经 IPv6 访问时会看到另一个地区" \
+      "在代理节点或代理设置里关闭 IPv6 出站，或换 IPv4/IPv6 同地区的节点"
+  fi
+
+  # ── B. 出口质量 (12) ──
+  if [[ "$PROXY" == "1" ]]; then
+    sig 质量 "IP 类型" 4 25 "公开代理/VPN" "出口 IP 被标记为公开代理/VPN 出口，属高风控段" "换独享节点或住宅 IP，避免与大量用户共用出口"
+  elif [[ "$HOSTING" == "1" ]]; then
+    sig 质量 "IP 类型" 4 50 "机房 IDC" "出口是机房(IDC) IP: ${ISP}，风控强度高于住宅" "有条件换住宅/家宽节点；至少保证独享且长期不变"
+  elif [[ "$HOSTING" == "0" ]]; then
+    if [[ "${ASN_MATCH:--1}" == "0" ]]; then
+      # 只有 ip-api 说它是住宅；另一家把同一段登记成骨干/IDC 运营商。
+      # 这种"住宅"经不起风控交叉核对，不给满分。
+      sig 质量 "IP 类型" 4 70 "住宅(归属存疑)" \
+        "ip-api 判该出口为住宅(${ISP})，但 ipinfo 归到 ${ISP2} —— 可能是机房段被标成住宅" \
+        "优先选各情报库一致认定为住宅/家宽的节点"
+    else
+      sig 质量 "IP 类型" 4 100 "住宅"
+    fi
+  else
+    sig 质量 "IP 类型" 4 70 "未知"
+  fi
+
+  # Cloudflare 边缘机房国家 vs IP 库国家: 不一致说明 IP 归属被"改过"或链路绕路
+  if [[ -n "$CF_LOC" && -n "$COUNTRY" ]]; then
+    if [[ "$CF_LOC" == "$COUNTRY" ]]; then
+      sig 质量 "边缘机房匹配" 3 100 "${CF_COLO} (${CF_LOC})"
+    else
+      sig 质量 "边缘机房匹配" 3 25 "${CF_COLO}(${CF_LOC}) ≠ ${COUNTRY}" \
+        "Cloudflare 边缘落在 ${CF_LOC}，与 IP 库归属 ${COUNTRY} 不一致" "该 IP 的地理归属可能是伪造的，换归属真实的节点"
+    fi
+  else
+    sig 质量 "边缘机房匹配" 3 50 "${CF_COLO:-未知}"
+  fi
+
+  # Cloudflare 看到的来源 IP 应与三路检测拿到的一致，否则中间还有一层出口
+  if [[ -n "$CF_IP" && "$PROBE_IP" != "?" ]]; then
+    if [[ "$CF_IP" == "$PROBE_IP" ]]; then
+      sig 质量 "出口链路单一" 3 100 "$CF_IP"
+    else
+      sig 质量 "出口链路单一" 3 0 "$CF_IP ≠ $PROBE_IP" \
+        "Cloudflare 看到的来源 ${CF_IP} 与检测到的出口 ${PROBE_IP} 不同，链路上还有一层代理" "统一走同一出口，避免多层嵌套代理"
+    fi
+  else
+    sig 质量 "出口链路单一" 3 50 "数据不足"
+  fi
+
+  # ── C. 地区画像一致性 (18) ──
+  if [[ "$CONSISTENT" == "1" ]]; then
+    sig 画像 "三路出口一致" 6 100 "$PROBE_IP"
+  elif [[ "$CONSISTENT" == "unknown" ]]; then
+    sig 画像 "三路出口一致" 6 0 "检测未完成，无法确认一致性" \
+      "三路出口检测未完成或结果已过期" "等待重新检测；检查超时探针及代理线路"
+  else
+    sig 画像 "三路出口一致" 6 30 "不一致" \
+      "三路出口 IP 不一致(分流/PAC/DNS 泄漏)，账号画像会在多地区间跳变" "代理切全局模式，让国内/国外/谷歌三路走同一出口"
+  fi
+
+  if [[ -n "$GFW_TZ" && "$GFW_TZ" == "$SYS_TZ" ]]; then
+    sig 画像 "系统时区匹配出口" 5 100 "$SYS_TZ"
+  elif [[ -z "$GFW_TZ" || "$GFW_TZ" == "?" ]]; then
+    sig 画像 "系统时区匹配出口" 5 50 "出口时区未知" "无法解析出口 IP 对应时区"
+  else
+    if [[ -n "$COUNTRY" ]] && in_list "$COUNTRY" "$UNSUPPORTED"; then
+      sig 画像 "系统时区匹配出口" 5 0 "$SYS_TZ ≠ $GFW_TZ" \
+        "系统时区 ${SYS_TZ} 与不支持地区出口时区 ${GFW_TZ} 不一致" "先换到支持地区且归属明确的节点，再按新出口修复时区"
+    else
+      sig 画像 "系统时区匹配出口" 5 0 "$SYS_TZ ≠ $GFW_TZ" \
+        "系统时区 ${SYS_TZ} 与出口时区 ${GFW_TZ} 不一致，是典型的环境矛盾信号" "可一键修复: 把系统时区改为 ${GFW_TZ}"
+      FIXABLE_TZ="$GFW_TZ"
+    fi
+  fi
+
+  if [[ "$TZ_SELF_CONSISTENT" == "1" ]]; then
+    sig 画像 "时区偏移自洽" 2 100 "UTC${TZ_OFFSET:0:3} ${TZ_ABBR}"
+  else
+    sig 画像 "时区偏移自洽" 2 0 "偏移与时区名冲突" \
+      "当前 UTC 偏移 ${TZ_OFFSET} 与时区 ${SYS_TZ} 不符(可能被 TZ 环境变量覆盖)" "清掉 shell 里的 TZ 环境变量"
+  fi
+
+  if [[ -z "$COUNTRY" || -z "$SYS_LOCALE" ]]; then
+    sig 画像 "系统区域匹配出口" 4 50 "数据不足"
+  elif [[ "$LOCALE_CC" == "$COUNTRY" ]]; then
+    sig 画像 "系统区域匹配出口" 4 100 "$SYS_LOCALE"
+  elif [[ -n "$COUNTRY" ]] && in_list "$COUNTRY" "$UNSUPPORTED"; then
+    sig 画像 "系统区域匹配出口" 4 50 "$SYS_LOCALE vs $COUNTRY" \
+      "系统区域 ${LOCALE_CC:-?} 与不支持地区出口 ${COUNTRY} 不一致" \
+      "先换到支持地区且归属明确的节点，不自动跟随当前出口修改系统区域"
+  elif [[ "$COUNTRY_CONFIRMED" != "1" ]]; then
+    sig 画像 "系统区域匹配出口" 4 50 "$SYS_LOCALE vs $COUNTRY" \
+      "系统区域 ${LOCALE_CC:-?} 与出口 ${COUNTRY} 不一致，但多个 IP 情报源对归属有分歧" \
+      "换归属明确的节点或重新体检；国家码一致前不自动修改系统区域"
+  elif [[ "$SYS_LANG" == zh* ]]; then
+    sig 画像 "系统区域匹配出口" 4 50 "$SYS_LOCALE vs $COUNTRY" \
+      "系统语言中文 + 区域 ${LOCALE_CC:-?} 与出口 ${COUNTRY} 不一致(网页端登录会暴露矛盾)" \
+      "点一键修复把系统区域改成 ${COUNTRY}，不会改显示语言"
+    FIXABLE_LOCALE="$COUNTRY"; FIXABLE_LOCALE_TARGET="${SYS_LOCALE%%_*}_${COUNTRY}"
+  else
+    sig 画像 "系统区域匹配出口" 4 70 "$SYS_LOCALE vs $COUNTRY" \
+      "系统区域 ${LOCALE_CC:-?} 与出口 ${COUNTRY} 不一致" \
+      "点一键修复把系统区域改成 ${COUNTRY}，不会改显示语言"
+    FIXABLE_LOCALE="$COUNTRY"; FIXABLE_LOCALE_TARGET="${SYS_LOCALE%%_*}_${COUNTRY}"
+  fi
+
+  # ── D. DNS (10) ──
+  case "$DNS_VERDICT" in
+    正常*|代理接管*) sig DNS "claude.ai 解析" 6 100 "$DNS_VERDICT" ;;
+    被污染*)        sig DNS "claude.ai 解析" 6 0 "$DNS_VERDICT" \
+                      "claude.ai 的 DNS 解析被污染(${DNS_RESULT})" "换 DoH/加密 DNS，或让代理接管 DNS(fake-ip 模式)" ;;
+    解析失败)       sig DNS "claude.ai 解析" 6 20 "失败" "claude.ai 无法解析" "检查 DNS 设置，建议让代理接管 DNS" ;;
+    *)              sig DNS "claude.ai 解析" 6 40 "$DNS_VERDICT" \
+                      "claude.ai 解析到非 Cloudflare 地址(${DNS_RESULT})，可能被劫持" "换 DoH/加密 DNS 或由代理接管 DNS" ;;
+  esac
+
+  # TUN 全局下 DNS 查询本身就走隧道出去，不会泄漏到国内网络，判定要跟着代理形态走
+  local tun=0; [[ "$PROXY_MODE" == "TUN 全局"* ]] && tun=1
+  case "$DNS_SCOPE" in
+    本地/代理接管*) sig DNS "DNS 出口" 4 100 "$DNS_SCOPE" ;;
+    国内公共DNS*)
+      if [[ $tun -eq 1 ]]; then
+        sig DNS "DNS 出口" 4 70 "$DNS_SCOPE (走隧道)" \
+          "用的是国内公共 DNS，虽然 TUN 下查询走隧道不算泄漏，但没必要绕这一圈" "换成 1.1.1.1 / 8.8.8.8"
+      else
+        sig DNS "DNS 出口" 4 0 "$DNS_SCOPE" \
+          "正在用${DNS_SCOPE}，DNS 查询泄漏到国内，与国外出口矛盾" \
+          "改用 1.1.1.1 / 8.8.8.8 或让代理接管 DNS"
+      fi ;;
+    *)
+      if [[ $tun -eq 1 ]]; then
+        sig DNS "DNS 出口" 4 100 "$DNS_SCOPE (走隧道)"
+      else
+        sig DNS "DNS 出口" 4 80 "$DNS_SCOPE"
+      fi ;;
+  esac
+
+  # ── E. 环境稳定性 / 运行容器 (10) ──
+  # 只检查首选语言，不让后续备用语言覆盖真实首选项。英语全球兼容；
+  # 其它语言无法可靠由 IP 推导时保持中性，只对高置信中文变体冲突扣分。
+  local sys_first="${SYS_LANGS%%,*}" sys_lang_status sys_lang_desc
+  sys_lang_status=$(language_status "$sys_first" "${COUNTRY:-}")
+  sys_lang_desc=$(language_conflict_text "$sys_first")
+  if [[ "$sys_lang_status" == "conflict" ]]; then
+    sig 画像 "语言变体一致" 2 50 "$sys_first vs $COUNTRY" \
+      "系统首选语言是${sys_lang_desc}，与出口 ${COUNTRY} 的地区画像不对应" \
+      "仅用 CLI 可忽略；网页端可在系统语言设置中把 $(recommended_language "$COUNTRY") 调到首位"
+  else
+    sig 画像 "语言变体一致" 2 100 "${sys_first:-未识别} · ${COUNTRY:-?}"
+  fi
+
+  if [[ "$PAC_ON" == "1" ]]; then
+    sig 稳定 "代理形态" 3 20 "$PROXY_MODE" \
+      "启用了 PAC 自动分流，不同网站会走不同出口，账号画像不稳定" "关掉 PAC，改用 TUN 全局模式"
+  elif [[ "$PROXY_MODE" == "TUN 全局" ]]; then
+    sig 稳定 "代理形态" 3 100 "$PROXY_MODE"
+  else
+    sig 稳定 "代理形态" 3 70 "$PROXY_MODE"
+  fi
+
+  if   [[ $IP_CHANGES -le 1 ]]; then sig 稳定 "出口稳定性" 4 100 "24h 内 ${IP_CHANGES} 次跳变"
+  elif [[ $IP_CHANGES -le 5 ]]; then
+    sig 稳定 "出口稳定性" 4 50 "24h 内 ${IP_CHANGES} 次跳变" \
+      "24 小时内出口 IP 变了 ${IP_CHANGES} 次，设备连续性差" "固定一个节点用，别让代理自动切换线路"
+  else
+    sig 稳定 "出口稳定性" 4 0 "24h 内 ${IP_CHANGES} 次跳变" \
+      "24 小时内出口 IP 变了 ${IP_CHANGES} 次，账号画像极不稳定" "关掉代理的自动切换/负载均衡，固定单一落地节点"
+  fi
+
+  if [[ "$VM_HOST" == "物理机" ]]; then
+    sig 稳定 "运行容器" 3 100 "物理机"
+  else
+    sig 稳定 "运行容器" 3 30 "$VM_HOST" \
+      "运行在${VM_HOST}中，设备指纹异常是风控关注的信号" "尽量在物理机上登录和使用 Claude"
+  fi
+
+  # ── F. 浏览器画像 (17) —— 由菜单栏 App 的真实浏览器桥接采集 ──
+  if [[ "$BR_OK" != "1" ]]; then
+    # 没采集到就按中性计分(70%)，不能因为"没测"判环境有问题，也不能白送满分。
+    # 命令行单跑时没有 WebView，分数会比菜单栏里低几分，属预期。
+    sig 浏览器 "WebRTC 出口" 6 70 "未采集"
+    sig 浏览器 "浏览器时区" 3 70 "未采集"
+    sig 浏览器 "浏览器语言" 2 70 "未采集"
+    # 1 分的项不值得因为"没测"就扣成 0/1，那看起来像 bug
+    sig 浏览器 "Intl 区域设置" 1 100 "未采集"
+    sig 浏览器 "Client Hints" 2 70 "未采集"
+    sig 浏览器 "HTTP 语言首标" 1 100 "未采集"
+    sig 浏览器 "渲染环境" 2 70 "未采集"
+  else
+    # WebRTC 走 UDP，不经过 HTTP 代理。只有检测明确完成时，“无公网候选”才算安全；
+    # 超时/异常/不支持按未知处理，避免原来把 STUN 失败直接当成满分。
+    case "${BR_RTC_STATUS:-}" in
+      none)
+        sig 浏览器 "WebRTC 出口" 6 100 "检测完成，无公网候选"
+        ;;
+      timeout|error|unsupported|collecting|"")
+        local rtc_desc
+        case "${BR_RTC_STATUS:-}" in
+          timeout|collecting|"") rtc_desc="检测超时" ;;
+          error) rtc_desc="检测异常${BR_RTC_ERROR:+：${BR_RTC_ERROR}}" ;;
+          unsupported) rtc_desc="浏览器不支持或已禁用" ;;
+        esac
+        sig 浏览器 "WebRTC 出口" 6 70 "$rtc_desc" \
+          "WebRTC 出口未能完成检测，暂时无法确认 UDP 是否被代理接管" \
+          "确认浏览器允许 WebRTC，并检查代理是否接管 UDP"
+        ;;
+      ok)
+        if [[ -z "$BR_RTC" ]]; then
+          sig 浏览器 "WebRTC 出口" 6 70 "已完成但没有公网候选数据"
+        elif [[ "$BR_RTC" == *"$PROBE_IP"* ]]; then
+          sig 浏览器 "WebRTC 出口" 6 100 "$BR_RTC = 出口"
+        else
+          local leak_n leak_cc
+          leak_n=${BR_RTC_PUBLIC_COUNT:-$(echo "$BR_RTC" | awk -F, '{print NF}')}
+          leak_cc=$(ip_country_code "${BR_RTC%%,*}")
+          sig 浏览器 "WebRTC 出口" 6 0 "${leak_n} 个泄漏 · ${leak_cc:-?} ≠ $COUNTRY" \
+            "WebRTC 暴露了 ${leak_n} 个非代理出口(首个 ${BR_RTC%%,*}${leak_cc:+，归属 $leak_cc})，UDP 绕过了代理" \
+            "代理开 TUN 全局(接管 UDP)，或在浏览器里禁用 WebRTC"
+        fi
+        ;;
+      *)
+        sig 浏览器 "WebRTC 出口" 6 70 "未知状态 ${BR_RTC_STATUS}"
+        ;;
+    esac
+
+    if [[ "$BR_TZ" == "$SYS_TZ" ]]; then
+      sig 浏览器 "浏览器时区" 3 100 "$BR_TZ"
+    else
+      sig 浏览器 "浏览器时区" 3 25 "$BR_TZ ≠ $SYS_TZ" \
+        "浏览器时区 ${BR_TZ} 与系统时区 ${SYS_TZ} 不一致" "重启浏览器让它重新读系统时区"
+    fi
+
+    # 浏览器语言是网页端的直接信号，但 IP 不能唯一决定语言。英语全球兼容；
+    # 地区码相同直接通过；只有可可靠识别的中文简繁变体冲突才扣分。
+    local br_lang_status br_lang_desc
+    br_lang_status=$(language_status "$BR_LANGS" "${COUNTRY:-}")
+    br_lang_desc=$(language_conflict_text "$BR_LANGS")
+    if [[ "$br_lang_status" == "conflict" ]]; then
+      sig 浏览器 "浏览器语言" 2 40 "$BR_LANGS vs $COUNTRY" \
+        "浏览器首选语言是${br_lang_desc}，与出口地区 ${COUNTRY} 矛盾(网页端登录时直接可见)" \
+        "$(browser_language_hint)"
+    else
+      sig 浏览器 "浏览器语言" 2 100 "${BR_LANGS:-?}"
+    fi
+
+    # Intl locale 通常跟随浏览器首选语言。英语和无法可靠归类的语言保持中性，
+    # 避免把 en-US + 台湾出口这类常见组合误判为风险。
+    local br_locale_status
+    br_locale_status=$(language_status "$BR_LOCALE" "${COUNTRY:-}")
+    if [[ -z "$BR_LOCALE" || -z "$COUNTRY" ]]; then
+      sig 浏览器 "Intl 区域设置" 1 100 "${BR_LOCALE:-?}"
+    elif [[ "$br_locale_status" == "conflict" ]]; then
+      sig 浏览器 "Intl 区域设置" 1 50 "$BR_LOCALE vs $COUNTRY" \
+        "浏览器 Intl 区域 ${BR_LOCALE} 与出口 ${COUNTRY} 明显冲突" "$(browser_language_hint)"
+    else
+      sig 浏览器 "Intl 区域设置" 1 100 "$BR_LOCALE"
+    fi
+
+    # 请求头完整性：把服务端实际收到的 UA / Accept-Language / Client Hints
+    # 与 JavaScript 读取值、真实系统和出口地区交叉核对。Safari/Firefox 没有 UA-CH 属正常。
+    local ch_plat="${BR_CH_PLAT:-$BR_UAD_PLAT}" brands="${BR_UAD_BRANDS:-$BR_CH_UA}"
+    local os_kind="macOS" ua_kind="" ua_probe="${BR_UA:-$BR_UA_JS}"
+    [[ "$OS_VER" == Windows* ]] && os_kind="Windows"
+    case "$ua_probe" in
+      *Windows*) ua_kind="Windows" ;; *Macintosh*|*Mac\ OS*) ua_kind="macOS" ;;
+      *Android*) ua_kind="Android" ;; *iPhone*|*iPad*) ua_kind="iOS" ;; *Linux*) ua_kind="Linux" ;;
+    esac
+    if [[ "$BR_SOURCE" != "browser" ]]; then
+      BR_HEADER_INTEGRITY="partial"
+      sig 浏览器 "Client Hints" 2 70 "内置引擎未采集请求头"
+    elif [[ -n "$BR_UA" && -n "$BR_UA_JS" && "$BR_UA" != "$BR_UA_JS" ]]; then
+      BR_HEADER_INTEGRITY="conflict"
+      sig 浏览器 "Client Hints" 2 0 "HTTP UA ≠ JS UA"         "浏览器请求头 User-Agent 与 JavaScript 读取值不一致，可能存在不完整的 UA 伪装"         "关闭修改 UA/指纹的扩展，使用原生浏览器配置"
+    elif [[ -n "$ua_kind" && "$ua_kind" != "$os_kind" ]]; then
+      BR_HEADER_INTEGRITY="conflict"
+      sig 浏览器 "Client Hints" 2 0 "UA ${ua_kind} ≠ 系统 ${os_kind}"         "浏览器 User-Agent 显示 ${ua_kind}，但真实系统是 ${os_kind}"         "关闭修改 UA 的扩展，使用原生浏览器登录"
+    elif [[ -n "$ch_plat" && "$ch_plat" != *"$os_kind"* ]]; then
+      BR_HEADER_INTEGRITY="conflict"
+      sig 浏览器 "Client Hints" 2 0 "$ch_plat ≠ $os_kind"         "浏览器上报的平台 ${ch_plat} 与真实系统 ${os_kind} 不符，UA 被改过或运行在异常容器中"         "关闭修改 UA 的扩展，使用原生浏览器登录"
+    elif [[ "$ua_probe" == *Chrome* || "$ua_probe" == *Chromium* || "$ua_probe" == *Edg/* ]] &&          [[ -n "$brands" && "$brands" != *Chromium* && "$brands" != *Chrome* && "$brands" != *Edge* ]]; then
+      BR_HEADER_INTEGRITY="conflict"
+      sig 浏览器 "Client Hints" 2 25 "Chromium UA 与 brands 不一致"         "浏览器 UA 显示 Chromium 系，但 Client Hints brands 不对应"         "关闭浏览器指纹伪装或 UA 修改扩展"
+    elif [[ -z "$ch_plat" ]]; then
+      BR_HEADER_INTEGRITY="ok"
+      sig 浏览器 "Client Hints" 2 100 "Safari/Firefox 不提供"
+    else
+      BR_HEADER_INTEGRITY="ok"
+      sig 浏览器 "Client Hints" 2 100 "$ch_plat${brands:+ · ${brands:0:22}}"
+    fi
+
+    # HTTP Accept-Language 是服务端最先看到的语言；先与 JS navigator.languages
+    # 交叉核对，再检查是否与出口国家明显冲突。
+    local accept_first="${BR_ACCEPT%%,*}" js_first="${BR_LANGS%%,*}" accept_norm js_norm accept_status
+    accept_first="${accept_first%%;*}"
+    accept_norm=$(normalize_lang_tag "$accept_first")
+    js_norm=$(normalize_lang_tag "$js_first")
+    accept_status=$(language_status "$accept_first" "${COUNTRY:-}")
+    if [[ "$BR_SOURCE" != "browser" || -z "$BR_ACCEPT" ]]; then
+      sig 浏览器 "HTTP 语言首标" 1 100 "${BR_ACCEPT:-未采集}"
+    elif [[ -n "$accept_norm" && -n "$js_norm" && "$accept_norm" != "$js_norm" ]]; then
+      BR_HEADER_INTEGRITY="conflict"
+      sig 浏览器 "HTTP 语言首标" 1 0 "$accept_first ≠ $js_first"         "HTTP Accept-Language 与 navigator.languages 首选语言不一致，浏览器画像存在矛盾"         "统一浏览器首选语言，并关闭修改请求头的扩展"
+    elif [[ "$accept_status" == "conflict" ]]; then
+      sig 浏览器 "HTTP 语言首标" 1 0 "$BR_ACCEPT vs $COUNTRY"         "请求头 Accept-Language: ${BR_ACCEPT} 与出口 ${COUNTRY} 明显冲突，服务端第一眼就能看到"         "$(browser_language_hint)"
+    else
+      sig 浏览器 "HTTP 语言首标" 1 100 "${BR_ACCEPT:0:24}"
+    fi
+
+    # 渲染环境: WebGL 渲染器 + 中文字体探测。字体是"国产终端弱信号"——
+    # 装着一堆中文字体本身不是问题(macOS 自带 PingFang)，只在拿不到 GPU 信息时才扣分
+    # WebGL 串很长("ANGLE (Apple, ANGLE Metal Renderer: Apple M3, ...)")，只留 GPU 型号
+    local gpu="${BR_WEBGL##*Renderer: }"; gpu="${gpu%%,*}"
+    local render_desc="${gpu:0:16}"
+    [[ -n "$BR_FONTS" ]] && render_desc+=" · $(echo "$BR_FONTS" | awk -F, '{print NF}') 中文字体"
+    if [[ -n "$BR_WEBGL" ]]; then
+      sig 浏览器 "渲染环境" 2 100 "$render_desc"
+    else
+      sig 浏览器 "渲染环境" 2 50 "未取到 GPU 信息"
+    fi
+  fi
+
+  # 关键项一票否决: 这几项任一不满分，总分再高也不能算"可用"。
+  # 90 分可能是"丢了 10 分轻微项(浏览器语言/Intl/渲染)"，也可能是
+  # "WebRTC 泄漏 6 分 + 时区不符 5 分" —— 后者真实出口已经暴露，风险天差地别。
+  local CRITICAL="|出口国家|Anthropic API 可达|系统时区匹配出口|WebRTC 出口|IPv6 出口|三路出口一致|"
+  local crit_fail="" row cg cl cw cp cv
+  for row in "${SIGNALS[@]}"; do
+    IFS='~' read -r cg cl cw cp cv <<<"$row"
+    case "$CRITICAL" in
+      *"|$cl|"*)
+        # WebRTC、IPv6 的部分分代表“未知”，只有确认不一致(0 分)才一票否决
+        if [[ "$cl" == "WebRTC 出口" || "$cl" == "IPv6 出口" ]]; then
+          [[ ${cp:-0} -eq 0 ]] && crit_fail+="${crit_fail:+、}$cl"
+        else
+          [[ ${cp:-0} -lt ${cw:-0} ]] && crit_fail+="${crit_fail:+、}$cl"
+        fi ;;
+    esac
+  done
+
+  # 出口落在不服务地区是硬性阻断: 国内直连的画像其实很自洽(中文+国内IP+国内时区全一致)，
+  # 不能让这些一致性得分把它抬进"基本可用"
+  if [[ -n "$COUNTRY" ]] && in_list "$COUNTRY" "$UNSUPPORTED"; then
+    GRADE="高风险"; VERDICT="$(region_note "$COUNTRY")"
+  # 三路出口不一致 = 分流模式，账号画像在多个地区间跳变，是风控最敏感的信号之一。
+  # 只按扣分算(才 5 分)会让 80 多分的环境显示"良好"，与红色图标自相矛盾 —— 硬降级。
+  elif [[ "$CONSISTENT" == "unknown" ]]; then
+    GRADE="待确认"; VERDICT="三路出口检测未完成或已过期，无法确认当前一致性"
+  elif [[ "$CONSISTENT" != "1" ]]; then
+    GRADE="风险"
+    VERDICT="出口 IP 分流(${CN_IP} / ${INTL_IP})，画像跳变，不建议使用"
+  # 档位措辞按二元标准: 只有绿档说"可用"，其余一律明说"不建议使用" ——
+  # 原来 83 分显示"良好"，和橙色图标、"不建议使用"的通知自相矛盾。
+  elif [[ $SCORE -ge 90 && -z "$crit_fail" ]]; then GRADE="优秀"; VERDICT="环境适合运行 Claude"
+  elif [[ -n "$crit_fail" ]]; then
+    GRADE="有风险"; VERDICT="关键项未达标（${crit_fail}），不建议使用"
+    [[ $SCORE -lt 70 ]] && GRADE="高风险"
+    [[ $SCORE -lt 50 ]] && GRADE="危险"
+  elif [[ $SCORE -ge 70 ]]; then GRADE="有风险"; VERDICT="有矛盾信号，先按提示修复"
+  elif [[ $SCORE -ge 50 ]]; then GRADE="高风险"; VERDICT="多项信号冲突，不建议登录"
+  else                           GRADE="危险"; VERDICT="画像严重冲突，封号风险高"
+  fi
+
+  # 分数只是量化参考；关键项失败、不支持地区或三路分流必须覆盖高分。
+  classify_risk "$crit_fail"
+}
+
+
+# 每项没拿满分时，具体做什么能把分补回来。issues/fixes 说的是"有什么问题"，
+# 这里说的是"下一步动手做什么"，菜单里按差值从大到小排给用户看。
+gain_hint() {
+  case "$1" in
+    "出口国家")          echo "换 US / JP / SG 节点" ;;
+    "Anthropic API 可达") echo "开全局代理直连 API" ;;
+    "claude.ai 可达")     echo "换干净节点" ;;
+    "多源情报一致")      echo "换归属明确的干净节点" ;;
+    "IP 类型")           [[ "${ASN_MATCH:--1}" == "0" && "${HOSTING:--1}" == "0" ]] \
+                           && echo "换 ASN 归属一致的住宅节点" \
+                           || echo "换住宅 / 家宽节点" ;;
+    "边缘机房匹配")      echo "换归属真实的节点" ;;
+    "出口链路单一")      echo "别叠多层代理" ;;
+    "三路出口一致")      echo "代理切全局模式" ;;
+    "系统时区匹配出口")  echo "点「一键修复」" ;;
+    "时区偏移自洽")      echo "清掉 TZ 变量后重开终端" ;;
+    "系统区域匹配出口")
+      if [[ -n "${FIXABLE_LOCALE:-}" ]]; then echo "点「一键修复」改为 ${FIXABLE_LOCALE_TARGET:-${COUNTRY:-对应地区}}"
+      else echo "先固定归属明确的支持地区节点，再重新体检"
+      fi ;;
+    "代理形态")
+      if [[ "$PAC_ON" == "1" ]]; then echo "点「一键修复」关 PAC，再开 TUN"
+      elif [[ "$CONSISTENT" == "1" && "$CF_IP" == "$PROBE_IP" ]]; then echo "代理在网关上可忽略，否则开 TUN"
+      else echo "代理开 TUN，关掉 PAC 分流"
+      fi ;;
+    "出口稳定性")        echo "24h 内别切线路，到点回满" ;;
+    "运行容器")          echo "别在虚拟机里用" ;;
+    "claude.ai 解析")     echo "换 DNS 或让代理接管" ;;
+    "DNS 出口")
+      if [[ "$DNS_SCOPE" == 国内公共DNS* || "$DNS_VERDICT" == 被污染* ]]; then echo "点「一键修复」换境外 DNS"
+      elif [[ "$DNS_SCOPE" == 境外/自定义* ]]; then echo "境外 DNS 可用，此 1 分可忽略"
+      else echo "让代理接管 DNS(fake-ip)"
+      fi ;;
+    "WebRTC 出口")       echo "代理开 TUN 接管 UDP" ;;
+    "浏览器时区")        echo "重启浏览器" ;;
+    "浏览器语言")        browser_language_hint ;;
+    "渲染环境")          echo "从菜单栏 App 体检" ;;
+    "anthropic.com 可达") echo "开全局代理；持续 403 换节点" ;;
+    "IPv6 出口")         echo "代理接管 IPv6，或系统关闭 IPv6" ;;
+    "语言变体一致")      echo "系统设置 → 通用 → 语言与地区；把 $(recommended_language "${COUNTRY:-}") 调到首位；重开相关 App" ;;
+    "Intl 区域设置")     browser_language_hint ;;
+    "Client Hints")      echo "关掉改 UA 的插件" ;;
+    "HTTP 语言首标")     browser_language_hint ;;
+    *)                   echo "重新体检" ;;
+  esac
+}
+
+# 未满分项 -> "标签~差值~动作"，按差值降序。菜单和报告都用它。
+build_gains() {
+  GAINS=""
+  local row g l w p v diff hint
+  local sorted
+  sorted=$(for row in "${SIGNALS[@]}"; do
+    IFS='~' read -r g l w p v <<<"$row"
+    diff=$((w - p)); [[ $diff -le 0 ]] && continue
+    echo "$diff~$l~$v"
+  done | sort -rn -t'~' -k1)
+  while IFS='~' read -r diff l v; do
+    [[ -z "$diff" ]] && continue
+    if [[ "$v" == *未采集* ]]; then
+      hint="从菜单栏 App 重新体检"
+    else
+      hint=$(gain_hint "$l")
+    fi
+    GAINS+="${GAINS:+|}${l}~${diff}~${hint}"
+  done <<<"$sorted"
+}
+
+# ── 自动修复 ────────────────────────────────────────────────────
+notify() { osascript -e "display notification \"$2\" with title \"$1\"" >/dev/null 2>&1; }
+
+# 当前活跃的网络服务名(Wi-Fi / Ethernet / ...)，networksetup 要用它定位
+active_service() {
+  local dev svc
+  dev=$(route -n get default 2>/dev/null | awk '/interface:/{print $2}')
+  [[ -z "$dev" ]] && return 1
+  # "Hardware Port: Wi-Fi" / "Device: en0" 成对出现，找到 dev 对应的那个 port
+  networksetup -listallhardwareports 2>/dev/null | awk -v d="$dev" '
+    /^Hardware Port:/{p=substr($0,16)} /^Device:/{if($2==d){print p; exit}}'
+}
+
+# 解析 claude.ai 检查候选 DNS；fake-ip 表示代理接管，允许设置但不能验证上游。
+dns_trusted() {
+  local srv="$1" ip
+  ip=$(dig +short +time=3 +tries=1 claude.ai "@$srv" 2>/dev/null | grep -E '^[0-9]+\.' | head -1)
+  [[ -z "$ip" ]] && ip=$(nslookup claude.ai "$srv" 2>/dev/null | awk '/^Address: /{print $2}' | tail -1)
+  case "$ip" in
+    198.18.*|198.19.*) echo "$ip"; return 0 ;;
+    160.79.10[45].*|104.*|172.6[4-9].*|162.15[89].*|188.114.*|141.101.*) echo "$ip"; return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# DNS 修复固定使用 1.1.1.1；允许代理接管的 fake-ip，保留其它异常拦截。
+fix_dns_servers() {
+  local svc="$1" srv ok="" ips=""
+  for srv in 1.1.1.1; do
+    if ip=$(dns_trusted "$srv"); then
+      case "$ip" in
+        198.18.*|198.19.*) echo "  ✓ 解析由代理接管 ($ip)，允许设置 ${srv}；未验证其实际上游" ;;
+        *) echo "  ✓ $srv 解析 claude.ai → $ip (通过检查)" ;;
+      esac
+      ok="$ok $srv"
+    else
+      echo "  ✗ $srv 解析异常，跳过"
+    fi
+  done
+  ok="${ok# }"
+  if [[ -z "$ok" ]]; then
+    echo "  ⚠️  1.1.1.1 未通过解析检查，改用加密 DNS 方案"
+    fix_dns_doh
+    return 1
+  fi
+  # 备份原设置，方便撤销
+  local bak="$DATA_DIR/dns_backup"
+  networksetup -getdnsservers "$svc" 2>/dev/null | tr '\n' ' ' >"$bak"
+  if cc_admin /usr/sbin/networksetup -setdnsservers "$svc" $ok >/dev/null 2>&1; then
+    dscacheutil -flushcache 2>/dev/null
+    echo "  ✅ 已把 $svc 的 DNS 改为: $ok"
+    echo "     撤销: sudo networksetup -setdnsservers \"$svc\" empty   (原值见 $bak)"
+    log "fix: DNS $svc -> $ok"
+    return 0
+  fi
+  echo "  ⚠️  改 DNS 需要授权，请重新确认修复并完成系统授权"
+  NEED_SUDO=1
+  return 1
+}
+
+# 备选方案: 加密 DNS(DoH) 描述文件。
+# 注意 macOS 把 DNS Settings 实现成 Network Extension，机器上跑着 VPN/TUN 类代理
+# (FlClash / Surge / Clash Verge 等)时安装会失败，报 "The VPN service could not be created"。
+# 所以它只作为公共 DNS 全被投毒时的兜底，不再当作首选。
+fix_dns_doh() {
+  local f="$DATA_DIR/Cloudflare-DoH.mobileconfig"
+  local u1 u2; u1=$(uuidgen); u2=$(uuidgen)
+  cat >"$f" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>PayloadContent</key><array><dict>
+    <key>PayloadType</key><string>com.apple.dnsSettings.managed</string>
+    <key>PayloadIdentifier</key><string>local.cc-daemon.doh</string>
+    <key>PayloadUUID</key><string>$u1</string>
+    <key>PayloadVersion</key><integer>1</integer>
+    <key>PayloadDisplayName</key><string>加密 DNS (Cloudflare DoH)</string>
+    <key>DNSSettings</key><dict>
+      <key>DNSProtocol</key><string>HTTPS</string>
+      <key>ServerURL</key><string>https://cloudflare-dns.com/dns-query</string>
+    </dict>
+  </dict></array>
+  <key>PayloadDisplayName</key><string>cc 加密 DNS</string>
+  <key>PayloadIdentifier</key><string>local.cc-daemon.doh.profile</string>
+  <key>PayloadType</key><string>Configuration</string>
+  <key>PayloadUUID</key><string>$u2</string>
+  <key>PayloadVersion</key><integer>1</integer>
+  <key>PayloadRemovalDisallowed</key><false/>
+</dict></plist>
+PLIST
+  echo "  📄 已生成 DoH 描述文件: $f"
+  echo "     需到 系统设置 → 通用 → 设备管理 双击安装(macOS 不允许程序自动安装)"
+  echo "     若报 'VPN service could not be created'，是代理 App 的网络扩展占用，先退出代理再装"
+  open "$f" 2>/dev/null
+}
+
+apply_fixes() {
+  [[ "$DO_FIX" == "1" && "$REPAIR_CONFIRMED" == "1" ]] || return 1
+  local done_any=0 svc
+  AUTO_FIXED_ITEMS=""; FIX_RESULTS=""; FIX_ERRORS=""
+  svc=$(active_service)
+
+  # 1. 时区（已获本次修复确认，再请求管理员授权）
+  if [[ -n "${FIXABLE_TZ:-}" && -f "$TZ_SCRIPT" ]]; then
+    echo "→ 修复时区: $SYS_TZ -> $FIXABLE_TZ"
+    CC_DATA_DIR="$DATA_DIR" bash "$TZ_SCRIPT" --apply-timezone --yes >/dev/null 2>&1
+    SYS_TZ=$(readlink /etc/localtime 2>/dev/null | sed 's#.*/zoneinfo/##')
+    TZ_OFFSET=$(date +%z); TZ_ABBR=$(date +%Z)
+    if [[ "$SYS_TZ" == "$FIXABLE_TZ" ]]; then
+      echo "  ✅ 已改为 $SYS_TZ"; log "fix: 时区 -> $SYS_TZ"; done_any=1
+      AUTO_FIXED_ITEMS+="|系统时区匹配出口|"
+      FIX_RESULTS+="${FIX_RESULTS:+；}时区：已改为 $SYS_TZ"
+      FIX_RESTART_PENDING=1
+    else
+      echo "  ⚠️  失败，需请重新确认修复并完成系统授权"; NEED_SUDO=1
+      FIX_ERRORS+="${FIX_ERRORS:+；}时区：缺少授权或系统拒绝修改"
+    fi
+  fi
+
+  # 2. 关掉 PAC 分流(分流会让账号画像在多地区跳变)
+  if [[ "${PAC_ON:-0}" == "1" && -n "$svc" ]]; then
+    echo "→ 关闭 PAC 自动分流 ($svc)"
+    if cc_admin /usr/sbin/networksetup -setautoproxystate "$svc" off >/dev/null 2>&1; then
+      echo "  ✅ 已关闭(撤销: networksetup -setautoproxystate \"$svc\" on)"
+      log "fix: 关闭 PAC ($svc)"; PAC_ON=0; PROXY_MODE="${PROXY_MODE% + PAC 分流}"; done_any=1
+      AUTO_FIXED_ITEMS+="|代理形态|"
+      FIX_RESULTS+="${FIX_RESULTS:+；}PAC：已关闭 $svc 的自动分流"
+    else
+      echo "  ⚠️  需要授权，请重新确认修复并完成系统授权"; NEED_SUDO=1
+      FIX_ERRORS+="${FIX_ERRORS:+；}PAC：缺少授权或系统拒绝修改"
+    fi
+  fi
+
+  # 3. DNS 泄漏 -> 换成验证过的境外 DNS(投毒时才退回 DoH)
+  if [[ "$DNS_SCOPE" == 国内公共DNS* || "$DNS_VERDICT" == 被污染* ]]; then
+    echo "→ 修复 DNS 泄漏 (当前 $DNS_SCOPE)"
+    if [[ -n "$svc" ]] && fix_dns_servers "$svc"; then
+      done_any=1; AUTO_FIXED_ITEMS+="|DNS 出口|"
+      FIX_RESULTS+="${FIX_RESULTS:+；}DNS：系统 DNS 已设为 1.1.1.1；代理可能仍接管解析"
+    elif [[ -z "$svc" ]]; then
+      echo "  ⚠️  找不到活跃网络服务"
+      FIX_ERRORS+="${FIX_ERRORS:+；}DNS：找不到活跃网络服务"
+    else
+      FIX_ERRORS+="${FIX_ERRORS:+；}DNS：公共 DNS 未通过验证或修改失败，按手动步骤处理"
+    fi
+  fi
+
+  # 4. 系统区域只改日期/数字等格式，不改显示语言或 AppleLanguages。
+  if [[ $FIX_LOCALE -eq 1 && -n "${FIXABLE_LOCALE:-}" ]]; then
+    local old_locale="$SYS_LOCALE" target_locale="${FIXABLE_LOCALE_TARGET:-${SYS_LOCALE%%_*}_${FIXABLE_LOCALE}}" actual_locale
+    echo "→ 修复系统区域: $old_locale -> $target_locale"
+    printf '%s\n' "$old_locale" >"$DATA_DIR/locale_backup" 2>/dev/null || true
+    if defaults write -g AppleLocale "$target_locale" 2>/dev/null; then
+      actual_locale=$(defaults read -g AppleLocale 2>/dev/null || true)
+      if [[ "$actual_locale" == "$target_locale" ]]; then
+        echo "  ✅ 已改(重开 App 生效，撤销: defaults write -g AppleLocale '$old_locale')"
+        done_any=1; AUTO_FIXED_ITEMS+="|系统区域匹配出口|"
+        FIX_RESULTS+="${FIX_RESULTS:+；}系统区域：$old_locale → $target_locale（重开 App 生效）"
+        FIX_RESTART_PENDING=1
+        SYS_LOCALE="$target_locale"; LOCALE_CC="$FIXABLE_LOCALE"
+      else
+        FIX_ERRORS+="${FIX_ERRORS:+；}系统区域：系统没有接受目标值 $target_locale"
+      fi
+    else
+      FIX_ERRORS+="${FIX_ERRORS:+；}系统区域：写入 $target_locale 失败"
+    fi
+  elif [[ -n "${FIXABLE_LOCALE:-}" ]]; then
+    FIX_ERRORS+="${FIX_ERRORS:+；}系统区域：需要从菜单的一键修复确认后修改"
+  fi
+
+  if [[ $done_any -eq 0 ]]; then
+    echo "没有可自动修复的项"
+  fi
+  show_manual_guide "$done_any"
+  return 0
+}
+
+# 需要用户自己动手的项(换节点、改浏览器语言、关 IPv6 …)，给出可照做的步骤
+show_manual_guide() {
+  local auto_done="$1" nl=$'\n' body="" l d h n=0
+  build_gains
+  while IFS='~' read -r l d h; do
+    [[ -z "$l" ]] && continue
+    # 只跳过本轮确实自动修复成功的项；“代理形态/DNS 出口”有时只能手动处理，
+    # 不能因为标签属于可修类别就把指引吞掉。
+    case "${AUTO_FIXED_ITEMS:-}" in *"|$l|"*) continue ;; esac
+    n=$((n+1))
+    body+="${n}. ${l}（+${d} 分）${nl}   ${h}${nl}"
+  done <<<"$(echo "$GAINS" | tr '|' '\n')"
+
+  if [[ $n -eq 0 ]]; then
+    [[ $auto_done -eq 1 ]] && notify "修复完成" "没有需要你手动处理的项"
+    return 0
+  fi
+  echo ""
+  echo "  下面 ${n} 项需要你自己操作:"
+  echo "$body" | sed 's/^/  /'
+
+  local tail_note="${nl}（这些步骤随时可以在菜单栏 →「📋 手动处理步骤」里翻到，不用记）"
+  local head="已自动修复的部分完成。还有 ${n} 项需要你手动处理："
+  [[ $auto_done -eq 0 ]] && head="有 ${n} 项需要你手动处理（这些无法自动完成）："
+  if [[ "${CC_GUI:-0}" != "1" ]]; then
+    osascript -e "display dialog \"${head}${nl}${nl}${body}${tail_note}\" buttons {\"知道了\"} default button 1 with title \"cc 修复指引\" with icon note" >/dev/null 2>&1 &
+  fi
+}
+
+# 有哪些项能自动修 —— 菜单栏据此决定是否亮"一键修复"
+fixable_list() {
+  local l=""
+  [[ -n "${FIXABLE_TZ:-}" ]] && l+="${l:+、}时区"
+  [[ -n "${FIXABLE_LOCALE:-}" ]] && l+="${l:+、}系统区域"
+  [[ "${PAC_ON:-0}" == "1" ]] && l+="${l:+、}关PAC分流"
+  [[ "$DNS_SCOPE" == 国内公共DNS* || "$DNS_VERDICT" == 被污染* ]] && l+="${l:+、}DNS 设置"
+  echo "$l"
+}
+
+write_cstatus() {
+  local target="${1:-$CSTATUS}" tmp="${1:-$CSTATUS}.tmp.$$"
+  local iptype
+  iptype=$( [[ "$PROXY" == 1 ]] && echo 代理/VPN || { [[ "$HOSTING" == 1 ]] && echo 机房IDC || { [[ "$HOSTING" == -1 ]] && echo 未知 || echo 住宅; }; } )
+  {
+    echo "time=$(date '+%Y-%m-%d %H:%M:%S')"
+    echo "score=$SCORE"; echo "grade=$GRADE"; echo "risklevel=${RISK_LEVEL:-未知}"
+    echo "safeuse=${SAFE_USE:-0}"; echo "verdict=$VERDICT"
+    echo "ip=${PROBE_IP}"; echo "country=${COUNTRY:-?}"; echo "countryname=${COUNTRY_NAME:-?}"
+    echo "city=${CITY:-?}"; echo "isp=${ISP:-?}"; echo "asn=${ASN:-?}"; echo "iptype=$iptype"
+    echo "latitude=${LATITUDE:-?}"; echo "longitude=${LONGITUDE:-?}"
+    echo "colo=${CF_COLO:-?}"; echo "cfloc=${CF_LOC:-?}"; echo "cfip=${CF_IP:-?}"; echo "cfwarp=${CF_WARP:-?}"
+    echo "api=${API_CODE}"; echo "web=${WEB_CODE}"; echo "site=${SITE_CODE}"; echo "apiregionblock=${API_REGION_BLOCK:-0}"
+    echo "intelsources=${INTEL_SOURCES:-未采集}"; echo "intelcount=${INTEL_COUNT:-0}"
+    echo "asn2=${ISP2:-?}"; echo "asnmatch=${ASN_MATCH:--1}"
+    echo "ipv6=${IPV6:-$( [[ "${IPV6_STATUS:-}" == "failed" ]] && echo 探测未完成 || echo 无 )}"; echo "ipv6country=${IPV6_CC:-?}"
+    echo "ipv6status=${IPV6_STATUS:-$( [[ -n "${IPV6:-}" ]] && echo ok || echo none )}"; echo "ipv6origin=${IPV6_ORIGIN:-}"
+    echo "network=${NETWORK_STATE:-unknown}"; echo "probe_complete=${NETWORK_COMPLETE:-0}"
+    echo "network_last_success=${NETWORK_LAST_SUCCESS:-}"
+    echo "cn=${CN_IP:-?}"; echo "intl=${INTL_IP:-?}"; echo "gfw=${GFW_IP:-?}"
+    echo "consistent=${CONSISTENT}"; echo "systz=${SYS_TZ}"; echo "iptz=${GFW_TZ:-?}"
+    echo "tzoffset=${TZ_OFFSET} ${TZ_ABBR}"; echo "locale=${SYS_LOCALE:-?}"; echo "langs=${SYS_LANGS:-?}"
+    echo "countryconfirmed=${COUNTRY_CONFIRMED:-0}"; echo "fixlocale=${FIXABLE_LOCALE_TARGET:-}"
+    echo "os=${OS_VER}"; echo "proxymode=${PROXY_MODE}"
+    echo "vmhost=${VM_HOST}"; echo "ipchanges=${IP_CHANGES}"
+    echo "brtz=${BR_TZ:-未采集}"; echo "brlangs=${BR_LANGS:-未采集}"; echo "brbrowser=${BR_BROWSER:-未知浏览器}"
+    echo "brrtc=${BR_RTC:-无}"; echo "brrtcstatus=${BR_RTC_STATUS:-未采集}"
+    echo "brrtccandidates=${BR_RTC_CANDIDATES:-0}"; echo "brrtcpublic=${BR_RTC_PUBLIC_COUNT:-0}"
+    echo "brrtcms=${BR_RTC_MS:-}"; echo "brfonts=${BR_FONTS:-?}"; echo "brwebgl=${BR_WEBGL:-?}"
+    echo "branthropic=${BR_REACH_ANTHROPIC:-未采集}"; echo "branthropicms=${BR_REACH_ANTHROPIC_MS:-}"
+    echo "brapi=${BR_REACH_API:-未采集}"; echo "brapims=${BR_REACH_API_MS:-}"
+    echo "brheaders=${BR_HEADER_INTEGRITY:-unknown}"
+    echo "brfetch=${BR_SF_SITE:-?}/${BR_SF_MODE:-?}/${BR_SF_DEST:-?}"
+    echo "dns=${DNS_SCOPE}"; echo "dnsservers=${DNS_SERVERS:-未获取}"
+    echo "dnsanswer=${DNS_RESULT:-无}"; echo "dnsresult=${DNS_VERDICT}"
+    echo "claudever=${CLAUDE_VER:-未安装}"; echo "base=${CLAUDE_BASE:-官方}"
+    echo "fixable=$( [[ -n "$(fixable_list)" ]] && echo 1 || echo 0 )"
+    echo "fixlist=$(fixable_list)"
+    echo "needsudo=${NEED_SUDO:-0}"
+    echo "fixresults=${FIX_RESULTS:-}"; echo "fixerrors=${FIX_ERRORS:-}"
+    echo "restartpending=${FIX_RESTART_PENDING:-0}"
+    echo "signals=$(IFS=';'; echo "${SIGNALS[*]}")"
+    echo "gains=$GAINS"
+    echo "issues=$ISSUES"; echo "fixes=$FIXES"
+  } >"$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
+  mv -f "$tmp" "$target" 2>/dev/null || { rm -f "$tmp"; return 1; }
+}
+
+publish_cstatus() {
+  local reasons previous_score failures=0
+  reasons=$(transient_check_reasons)
+  previous_score=$(status_value "$CSTATUS" score || true)
+  failures=$(status_value "$CPROBE_STATE" failure_count || true)
+  [[ "$failures" =~ ^[0-9]+$ ]] || failures=0
+
+  if [[ -n "$reasons" && "$previous_score" =~ ^[0-9]+$ && $SCORE -lt $previous_score ]] \
+      && ! confirmed_risk_present; then
+    failures=$(( failures + 1 ))
+    if [[ $failures -lt $SCORE_CONFIRM_REQUIRED ]]; then
+      write_cstatus "$CCANDIDATE"
+      write_score_probe_state "verifying" "$failures" "$SCORE" "$reasons"
+      log "cc-check: 候选 ${SCORE}/100（${reasons}），保留上次 ${previous_score}/100，复核 ${failures}/${SCORE_CONFIRM_REQUIRED}"
+      return 1
+    fi
+
+    write_cstatus "$CSTATUS"
+    write_score_probe_state "unstable" "$failures" "$SCORE" "$reasons"
+    rm -f "$CCANDIDATE"
+    return 0
+  fi
+
+  write_cstatus "$CSTATUS"
+  write_score_probe_state "ok" 0 "$SCORE" ""
+  rm -f "$CCANDIDATE"
+  return 0
+}
+
+print_report() {
+  local bar i
+  bar=""; for ((i=0;i<20;i++)); do [[ $((i*5)) -lt $SCORE ]] && bar+="█" || bar+="░"; done
+  echo ""
+  echo "  Claude 运行环境体检"
+  echo "  ──────────────────────────────────────────────────────"
+  echo "  得分  $bar  ${SCORE}/100  【${GRADE}】"
+  echo "  结论  ${VERDICT}"
+  echo ""
+  local group="" g l w p v
+  for row in "${SIGNALS[@]}"; do
+    IFS='~' read -r g l w p v <<<"$row"
+    [[ "$g" != "$group" ]] && { group="$g"; echo "  ── $g ──"; }
+    printf "  %-6s %-18s %-26s %2d/%-2d\n" "$([[ $p -eq $w ]] && echo ✓ || echo ⚠)" "$l" "$v" "$p" "$w"
+  done
+  echo ""
+  echo "  出口 ${PROBE_IP} · ${COUNTRY_NAME:-?} ${CITY:-} · ${ISP:-?} · ${ASN:-?}"
+  echo "  情报 ${INTEL_SOURCES:-未采集}"
+  echo "  系统 ${OS_VER} · ${SYS_LOCALE:-?} · ${SYS_TZ} · ${PROXY_MODE} · ${VM_HOST}"
+  echo "  DNS  ${DNS_SCOPE} · claude.ai → ${DNS_VERDICT}"
+  echo "  CLI  ${CLAUDE_VER:-未检测到} · 接口 ${CLAUDE_BASE:-官方}"
+  if [[ "$BR_OK" == "1" ]]; then
+    echo "  浏览 ${BR_TZ} · ${BR_LANGS} · WebRTC ${BR_RTC_STATUS:-未采集}${BR_RTC:+/${BR_RTC}} · 候选 ${BR_RTC_CANDIDATES:-0} · ${BR_FONTS:-无中文字体}"
+    echo "  浏览器访问 anthropic.com ${BR_REACH_ANTHROPIC:-未采集}${BR_REACH_ANTHROPIC_MS:+/${BR_REACH_ANTHROPIC_MS}ms} · API ${BR_REACH_API:-未采集}${BR_REACH_API_MS:+/${BR_REACH_API_MS}ms}"
+  else
+    echo "  浏览 未采集(浏览器信号由菜单栏 App 的隐藏 WebView 提供，命令行单跑时没有)"
+  fi
+  if [[ -n "$GAINS" ]]; then
+    echo ""
+    echo "  还能提 $((100 - SCORE)) 分"
+    echo "$GAINS" | tr '|' '\n' | while IFS='~' read -r l d h; do
+      [[ -z "$l" ]] && continue
+      printf "    +%-3s %-18s %s\n" "$d" "$l" "$h"
+    done
+  fi
+  if [[ -n "$ISSUES" ]]; then
+    echo ""; echo "  发现的问题"
+    echo "$ISSUES" | tr '|' '\n' | sed 's/^/    • /'
+    echo ""; echo "  修复建议"
+    echo "$FIXES" | tr '|' '\n' | grep -v '^$' | sed 's/^/    → /'
+    [[ -n "${FIXABLE_TZ:-}" ]] && { echo ""; echo "    可自动修复: ./cc-check.sh --fix"; }
+  else
+    echo ""; echo "  ✅ 未发现环境矛盾信号"
+  fi
+  echo ""
+}
+
+main() {
+  FIX_RESULTS=""; FIX_ERRORS=""; FIX_RESTART_PENDING=0
+  refresh_base
+  fetch_all
+  parse_net
+  parse_dns
+  parse_system
+  parse_stability
+  parse_browser
+  parse_claude
+  compute_score
+  if [[ $DO_FIX -eq 1 ]]; then
+    echo "本次可修复：$(fixable_list)。可能修改时区、DNS、PAC 和区域格式；具体按检测结果执行。"
+    cc_confirm "确认执行本次配置修复？" || return 1
+    local before=$SCORE
+    apply_fixes
+    parse_dns              # DNS 改动后重新采集
+    parse_system           # 代理形态可能也变了
+    compute_score          # 修完重新打分
+    if [[ "${NEED_SUDO:-0}" == "1" ]]; then
+      notify "修复需要授权" "请重新确认修复并完成系统授权"
+    elif [[ $SCORE -gt $before ]]; then
+      notify "Claude 环境已修复" "${before} → ${SCORE} 分"
+    else
+      # 分数没变不代表没干活(DoH 要用户自己点安装)，也得给个回音，
+      # 否则从菜单点"一键修复"看着像什么都没发生。
+      notify "体检完成" "${SCORE} 分$( [[ -n "$(fixable_list)" ]] && echo "，剩余待处理: $(fixable_list)" )"
+    fi
+  fi
+  build_gains
+  local published=1
+  publish_cstatus || published=0
+  [[ "$MODE" != "quiet" ]] && print_report
+  if [[ $published -eq 1 ]]; then
+    log "cc-check: ${SCORE}/100 ${GRADE} country=${COUNTRY:-?} api=${API_CODE} dns=${DNS_VERDICT}"
+  fi
+  exit 0
+}
+
+# ponytail: CC_CHECK_SELFTEST=1 时只加载函数不执行，供 test-cc-check.sh 直接测评分逻辑
+[[ -n "${CC_CHECK_SELFTEST:-}" ]] || main "$@"

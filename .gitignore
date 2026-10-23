@@ -1,0 +1,21 @@
+# 构建产物
+menubar/*.app/
+menubar/cc
+menubar/cc-arm64
+menubar/cc-x86_64
+*.dmg
+
+# 运行时数据 / 日志(含本机 IP，勿提交)
+*.log
+status
+last_state
+menubar_debug.log
+
+.DS_Store
+
+# Windows 版本暂不维护，不纳入版本管理
+windows/
+
+
+# 本机工具链备份，不提交
+.local-backups/
